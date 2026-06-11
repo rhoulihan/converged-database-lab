@@ -1,0 +1,50 @@
+# Validator
+
+Runs every module's demo scripts against the live lab container and reports
+pass/fail per script. This is the gate: a module is not done until the
+validator passes against a fresh `docker compose up`.
+
+## Discovery
+
+Scripts live in `modules/NN-slug/scripts/` and run in lexical order (modules,
+then scripts within each module):
+
+- `*.sql` — executed statement-by-statement via python-oracledb (thin mode) as
+  `LAB_USER` against `localhost:1521/FREEPDB1`. PL/SQL blocks end with a line
+  containing only `/`; plain SQL statements end with `;`.
+- `*.js` — executed with `mongosh` inside the `lab-oracle` container against
+  the MongoDB API (port 27017, `lab_user` database).
+
+Connection overrides: `LAB_DSN`, `LAB_USER`, `LAB_PASSWORD`, `LAB_MONGO_URI`.
+
+## Assertions
+
+SQL scripts assert by SELECTing literal strings of the form
+`ASSERT:<name>:PASS|FAIL` as the first column:
+
+```sql
+SELECT 'ASSERT:customer-count:' || CASE WHEN COUNT(*) = 200 THEN 'PASS' ELSE 'FAIL' END
+FROM customers;
+```
+
+JS scripts `print()` the same convention:
+
+```js
+print('ASSERT:dv-count:' + (db.customer_profile_dv.countDocuments({}) === 200 ? 'PASS' : 'FAIL'));
+```
+
+Every script must leave the domain unchanged. SQL scripts run in a single
+transaction that the harness rolls back after the script completes. JS scripts
+go through the MongoDB API (auto-commit), so they must clean up explicitly —
+delete what they insert, restore what they update.
+
+## Running
+
+```bash
+docker compose up -d --build oracle          # wait for healthy
+pip install -r validator/requirements.txt
+python validator/run.py
+```
+
+Exit code is 0 iff every assertion in every script is PASS and no script
+errored. Full detail lands in `validator/results.json` (gitignored).
