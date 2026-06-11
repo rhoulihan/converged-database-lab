@@ -22,6 +22,8 @@ pip install -r validator/requirements.txt
 python validator/run.py               # runs every module, prints ASSERT results
 ```
 
+If the container goes `unhealthy`, check `docker logs lab-oracle` — the most common cause is an ORDS install failure on first boot; `docker compose down -v && docker compose up -d --build oracle` usually resolves it.
+
 **Connection cheatsheet**
 
 | Interface | Connection string |

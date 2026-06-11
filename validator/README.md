@@ -46,6 +46,11 @@ delete what they insert, restore what they update.
   `/* ... */` comments are always safe.
 - Do not end a file with a bare comment block followed by `;` — there is no
   statement there. (Trailing comment-only text after the last `;` is ignored.)
+- `CREATE TYPE` and `CREATE TYPE BODY` are **not supported** in module scripts.
+  The PL/SQL block detector recognises `DECLARE`, `BEGIN`, and named subprograms
+  (`FUNCTION`, `PROCEDURE`, `PACKAGE`, `TRIGGER`) but not type definitions, so
+  type DDL will be mis-parsed and silently dropped. Use anonymous blocks or
+  stored procedures instead.
 
 ## Running
 

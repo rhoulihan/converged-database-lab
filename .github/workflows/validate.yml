@@ -19,12 +19,17 @@ jobs:
       - name: Boot lab (build + init)
         run: |
           docker compose up -d --build oracle
-          # Health check polls every 15s with up to 20 retries + 120s start_period.
+          # Health check polls every 15s with up to 40 retries + 120s start_period.
           # We wait up to 90 × 15s = 22.5 min, which covers the cold-start image pull
-          # and DB initialization in CI. Break early once healthy.
+          # and DB initialization in CI. Break early once healthy; fail fast on unhealthy.
           for i in $(seq 1 90); do
             status=$(docker inspect -f '{{.State.Health.Status}}' lab-oracle 2>/dev/null || echo "starting")
             [ "$status" = "healthy" ] && echo "Healthy after $((i * 15))s" && break
+            if [ "$status" = "unhealthy" ]; then
+              echo "Container is unhealthy — printing last 100 log lines and aborting"
+              docker logs lab-oracle --tail 100
+              exit 1
+            fi
             echo "[$i/90] status=$status — sleeping 15s"
             sleep 15
           done

@@ -29,7 +29,7 @@ ROLLBACK;
 
 SELECT /* and atomically gone after rollback */
        'ASSERT:rollback-relational:' ||
-       CASE WHEN NOT EXISTS (SELECT 1 FROM orders WHERE total_amount = 99.99) THEN 'PASS' ELSE 'FAIL' END FROM dual;
+       CASE WHEN NOT EXISTS (SELECT 1 FROM orders WHERE total_amount = 99.99 AND status = 'placed') THEN 'PASS' ELSE 'FAIL' END FROM dual;
 SELECT 'ASSERT:rollback-document:' ||
        CASE WHEN NOT EXISTS (SELECT 1 FROM events e WHERE e.data.type.string() = 'order_placed') THEN 'PASS' ELSE 'FAIL' END FROM dual;
 SELECT 'ASSERT:rollback-vector:' ||

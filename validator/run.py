@@ -59,7 +59,8 @@ def split_sql(text):
 
 def run_sql(path, conn):
     asserts, errors = [], []
-    text = open(path, encoding="utf-8").read()
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
     cur = conn.cursor()
     for stmt in split_sql(text):
         try:
@@ -77,7 +78,8 @@ def run_sql(path, conn):
 def run_js(path):
     cmd = ["docker", "exec", "-i", "lab-oracle", "mongosh", "--quiet", MONGO_URI,
            "--file", "/dev/stdin"]
-    proc = subprocess.run(cmd, stdin=open(path, "rb"), capture_output=True, text=True, timeout=300)
+    with open(path, "rb") as fh:
+        proc = subprocess.run(cmd, stdin=fh, capture_output=True, text=True, timeout=300)
     out = proc.stdout + proc.stderr
     asserts = re.findall(r"ASSERT:[\w-]+:(?:PASS|FAIL)", out)
     errors = [] if proc.returncode == 0 else [f"{os.path.basename(path)}: mongosh rc={proc.returncode}\n{out[-800:]}"]
