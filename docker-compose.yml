@@ -1,0 +1,41 @@
+name: converged-database-lab
+
+services:
+  oracle:
+    build:
+      context: ./docker
+      dockerfile: Dockerfile.oracle
+    container_name: lab-oracle
+    ports: ['1521:1521', '8181:8181', '27017:27017']
+    environment:
+      ORACLE_PASSWORD: '${ORACLE_PASSWORD:-LabAdmin2026}'
+      APP_USER: 'LAB_USER'
+      APP_USER_PASSWORD: '${LAB_PASSWORD:-LabUser2026}'
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+    healthcheck:
+      test: ['CMD-SHELL', '/opt/oracle/healthcheck.sh && curl -so /dev/null -w "%{http_code}" http://localhost:8181/ | grep -q "302\|200"']
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 120s
+    deploy:
+      resources:
+        limits: { cpus: '2', memory: 4G }
+
+  # Comparison target for head-to-head demos (modules 03/06). Single-node replica set
+  # (transactions require it). Start with: docker compose --profile mongodb up -d
+  mongodb:
+    image: mongo:8.2
+    container_name: lab-mongodb
+    profiles: ['mongodb']
+    command: ['mongod', '--replSet', 'rs0', '--bind_ip_all']
+    ports: ['27027:27017']
+    healthcheck:
+      test: ['CMD', 'mongosh', '--quiet', '--eval', "try { rs.status().ok } catch (e) { rs.initiate().ok }"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+
+volumes:
+  oracle-data:

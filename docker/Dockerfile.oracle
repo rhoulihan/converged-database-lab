@@ -1,0 +1,17 @@
+# Oracle AI Database 26ai Free + ORDS + MongoDB API.
+# Note: gvenzl image tags use year.quarter numbering (23.26.x == the 26ai release line).
+FROM gvenzl/oracle-free:23.26.0-faststart
+
+USER root
+COPY scripts/install-ords.sh /tmp/install-ords.sh
+RUN chmod +x /tmp/install-ords.sh && /tmp/install-ords.sh && rm /tmp/install-ords.sh
+RUN chown -R oracle:oinstall /etc/ords
+
+COPY init/ /container-entrypoint-initdb.d/
+
+COPY scripts/entrypoint.sh /opt/oracle/scripts/entrypoint.sh
+RUN chmod +x /opt/oracle/scripts/entrypoint.sh
+
+USER oracle
+EXPOSE 1521 8181 27017
+ENTRYPOINT ["/opt/oracle/scripts/entrypoint.sh"]
