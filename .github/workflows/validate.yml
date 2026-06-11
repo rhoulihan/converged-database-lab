@@ -1,0 +1,64 @@
+name: validate
+on:
+  push: { branches: [main, 'article/**'] }
+  pull_request:
+  schedule:
+    - cron: '17 6 * * *'   # nightly: substantive freshness, not cosmetic
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Boot lab (build + init)
+        run: |
+          docker compose up -d --build oracle
+          # Health check polls every 15s with up to 20 retries + 120s start_period.
+          # We wait up to 90 × 15s = 22.5 min, which covers the cold-start image pull
+          # and DB initialization in CI. Break early once healthy.
+          for i in $(seq 1 90); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' lab-oracle 2>/dev/null || echo "starting")
+            [ "$status" = "healthy" ] && echo "Healthy after $((i * 15))s" && break
+            echo "[$i/90] status=$status — sleeping 15s"
+            sleep 15
+          done
+          final=$(docker inspect -f '{{.State.Health.Status}}' lab-oracle)
+          if [ "$final" != "healthy" ]; then
+            echo "Container never became healthy (status=$final)"
+            docker logs lab-oracle --tail 100
+            exit 1
+          fi
+
+      - name: Verify domain initialized
+        # Use a heredoc piped to sqlplus to avoid all shell-quoting issues.
+        # The grep checks for 'customers=200' in the output.
+        run: |
+          docker exec lab-oracle bash -c "sqlplus -s / as sysdba <<'ENDSQL'
+          ALTER SESSION SET CONTAINER=FREEPDB1;
+          SELECT 'customers='||COUNT(*) FROM lab_user.customers;
+          ENDSQL
+          " | grep -q 'customers=200'
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Run validator
+        run: |
+          pip install -r validator/requirements.txt
+          python validator/run.py
+
+      - name: Job summary
+        if: always()
+        run: |
+          echo "## Validation against Oracle AI Database 26ai Free — $(date -u +%F)" >> "$GITHUB_STEP_SUMMARY"
+          python -c "import json;d=json.load(open('validator/results.json'));print('\n'.join(f\"- {'✅' if r['status']=='PASS' else '❌'} {r['module']}/{r['script']} ({len(r['assertions'])} assertions)\" for r in d['results']))" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: results, path: validator/results.json }
