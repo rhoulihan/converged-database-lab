@@ -2,14 +2,8 @@ ALTER SESSION SET CONTAINER = FREEPDB1;
 ALTER SESSION SET CURRENT_SCHEMA = lab_user;
 
 DECLARE
-  seed   NUMBER := 42;
-  FUNCTION nxt RETURN NUMBER IS  -- LCG: deterministic across runs
-  BEGIN
-    seed := MOD(seed * 1103515245 + 12345, 2147483648);
-    RETURN seed / 2147483648;
-  END;
-  FUNCTION pick(n IN PLS_INTEGER) RETURN PLS_INTEGER IS
-  BEGIN RETURN TRUNC(nxt * n) + 1; END;
+  -- All item declarations must precede subprogram bodies (PLS-00103 otherwise).
+  seed    NUMBER := 42;
   v_vec   VARCHAR2(400);
   v_norm  NUMBER;
   TYPE t_f IS TABLE OF NUMBER INDEX BY PLS_INTEGER;
@@ -17,6 +11,20 @@ DECLARE
   v_total NUMBER;
   v_items PLS_INTEGER;
   v_price NUMBER;
+  -- Local functions cannot be referenced inside SQL (PLS-00231), so every
+  -- nxt/pick value is computed into these before its INSERT.
+  v_cust  PLS_INTEGER;
+  v_store PLS_INTEGER;
+  v_prod  PLS_INTEGER;
+  v_qty   PLS_INTEGER;
+  v_ts    TIMESTAMP;
+  FUNCTION nxt RETURN NUMBER IS  -- LCG: deterministic across runs
+  BEGIN
+    seed := MOD(seed * 1103515245 + 12345, 2147483648);
+    RETURN seed / 2147483648;
+  END;
+  FUNCTION pick(n IN PLS_INTEGER) RETURN PLS_INTEGER IS
+  BEGIN RETURN TRUNC(nxt * n) + 1; END;
 BEGIN
   FOR i IN 1..200 LOOP
     INSERT INTO customers (email, full_name, segment)
@@ -25,11 +33,12 @@ BEGIN
   END LOOP;
 
   FOR i IN 1..50 LOOP
+    v_price := ROUND(10 + nxt*490, 2);
     INSERT INTO products (sku, name, category, list_price, attributes)
     VALUES ('SKU-'||LPAD(i,4,'0'), 'Product '||i,
             CASE MOD(i,5) WHEN 0 THEN 'audio' WHEN 1 THEN 'compute'
                           WHEN 2 THEN 'storage' WHEN 3 THEN 'network' ELSE 'accessory' END,
-            ROUND(10 + nxt*490, 2),
+            v_price,
             JSON('{"color":"'||CASE MOD(i,3) WHEN 0 THEN 'black' WHEN 1 THEN 'silver' ELSE 'blue' END||
                  '","warrantyMonths":'||(12*(MOD(i,3)+1))||'}'));
   END LOOP;
@@ -67,15 +76,20 @@ BEGIN
   FOR i IN 1..1000 LOOP
     v_items := pick(4);
     v_total := 0;
+    v_cust  := pick(200);
+    v_store := pick(6);
+    v_ts    := TIMESTAMP '2026-01-01 00:00:00' + NUMTODSINTERVAL(TRUNC(nxt*150), 'DAY');
     INSERT INTO orders (customer_id, store_id, status, order_ts, total_amount)
-    VALUES (pick(200), pick(6),
+    VALUES (v_cust, v_store,
             CASE WHEN MOD(i,29)=0 THEN 'returned' WHEN MOD(i,3)=0 THEN 'delivered'
                  WHEN MOD(i,2)=0 THEN 'shipped' ELSE 'placed' END,
-            TIMESTAMP '2026-01-01 00:00:00' + NUMTODSINTERVAL(TRUNC(nxt*150), 'DAY'), 0);
+            v_ts, 0);
     FOR j IN 1..v_items LOOP
       v_price := ROUND(10 + nxt*490, 2);
+      v_prod  := pick(50);
+      v_qty   := pick(3);
       INSERT INTO order_items (order_id, line_no, product_id, qty, unit_price)
-      VALUES (i, j, pick(50), pick(3), v_price);
+      VALUES (i, j, v_prod, v_qty, v_price);
       v_total := v_total + v_price;
     END LOOP;
     UPDATE orders SET total_amount = ROUND(v_total,2) WHERE order_id = i;
@@ -90,8 +104,9 @@ BEGIN
       v_vec := v_vec || TO_CHAR(ROUND(f(d)/v_norm, 6),'FM990.999999') || CASE WHEN d<8 THEN ',' END;
     END LOOP;
     v_vec := v_vec || ']';
+    v_cust := pick(200);
     INSERT INTO support_tickets (customer_id, subject, body, status, embedding)
-    VALUES (pick(200),
+    VALUES (v_cust,
             CASE MOD(i,4) WHEN 0 THEN 'Refund request for damaged item'
                           WHEN 1 THEN 'Cannot sign in after password reset'
                           WHEN 2 THEN 'Shipping delay on recent order'
