@@ -27,24 +27,34 @@ MONGO_URI = os.environ.get(
 )
 
 def split_sql(text):
-    """Yield executable statements. PL/SQL blocks end with a line '/'; plain SQL ends ';'."""
-    buf, in_plsql = [], False
+    """Yield executable statements. PL/SQL blocks end with a line '/'; plain SQL ends ';'.
+
+    Standalone '--' comment lines before a statement's first code line are
+    dropped, so every yielded statement starts with code (otherwise a leading
+    comment would defeat the SELECT/WITH fetch check in run_sql and silently
+    swallow assertions). Comments inside a statement are kept — legal SQL.
+    """
+    buf, in_plsql, has_code = [], False, False
     for line in text.splitlines():
         stripped = line.strip()
-        if not buf and re.match(r"^(DECLARE|BEGIN|CREATE\s+(OR\s+REPLACE\s+)?(FUNCTION|PROCEDURE|PACKAGE|TRIGGER))",
+        if not has_code and stripped.startswith("--"):
+            continue  # leading comments never attach to the next statement
+        if not has_code and re.match(r"^(DECLARE|BEGIN|CREATE\s+(OR\s+REPLACE\s+)?(FUNCTION|PROCEDURE|PACKAGE|TRIGGER))",
                                 stripped, re.I):
             in_plsql = True
         if in_plsql and stripped == "/":
-            yield "\n".join(buf); buf, in_plsql = [], False
+            yield "\n".join(buf); buf, in_plsql, has_code = [], False, False
             continue
         buf.append(line)
+        if stripped:
+            has_code = True
         if not in_plsql and stripped.endswith(";") and not stripped.startswith("--"):
             stmt = "\n".join(buf).strip().rstrip(";")
-            if stmt and not all(l.strip().startswith("--") or not l.strip() for l in stmt.splitlines()):
+            if stmt:
                 yield stmt
-            buf = []
+            buf, has_code = [], False
     rest = "\n".join(buf).strip()
-    if rest:
+    if rest and has_code:
         yield rest.rstrip("/").strip()
 
 def run_sql(path, conn):

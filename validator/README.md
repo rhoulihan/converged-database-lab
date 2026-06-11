@@ -38,6 +38,15 @@ transaction that the harness rolls back after the script completes. JS scripts
 go through the MongoDB API (auto-commit), so they must clean up explicitly —
 delete what they insert, restore what they update.
 
+## Authoring rules (SQL comments)
+
+- Standalone `--` comment lines before a statement are stripped by the
+  harness and never attach to the statement that follows — safe to use freely.
+- `--` comments inside a statement (after its first code line) and inline
+  `/* ... */` comments are always safe.
+- Do not end a file with a bare comment block followed by `;` — there is no
+  statement there. (Trailing comment-only text after the last `;` is ignored.)
+
 ## Running
 
 ```bash
