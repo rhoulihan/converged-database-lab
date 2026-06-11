@@ -7,6 +7,12 @@ COPY scripts/install-ords.sh /tmp/install-ords.sh
 RUN chmod +x /tmp/install-ords.sh && /tmp/install-ords.sh && rm /tmp/install-ords.sh
 RUN chown -R oracle:oinstall /etc/ords
 
+# mongosh: used to verify and exercise the MongoDB API (port 27017) from inside
+# the container — the validator harness runs *.js scripts through it.
+RUN printf '[mongodb-org-8.0]\nname=MongoDB Repository\nbaseurl=https://repo.mongodb.org/yum/redhat/8/mongodb-org/8.0/x86_64/\ngpgcheck=1\nenabled=1\ngpgkey=https://pgp.mongodb.com/server-8.0.asc\n' > /etc/yum.repos.d/mongodb-org-8.0.repo \
+ && microdnf install -y mongodb-mongosh \
+ && microdnf clean all
+
 COPY init/ /container-entrypoint-initdb.d/
 
 COPY scripts/entrypoint.sh /opt/oracle/scripts/entrypoint.sh
