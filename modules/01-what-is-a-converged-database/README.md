@@ -1,6 +1,6 @@
 # Module 01 — What Is a Converged Database?
 
-Four runnable proofs for the anchor article's core claims. Every script executes
+Five runnable proofs for the anchor article's core claims. Every script executes
 against the live lab container and emits machine-checkable assertions
 (`ASSERT:<name>:PASS|FAIL`). No screenshots, no trust-me — run them yourself.
 
@@ -78,6 +78,39 @@ Expected assertions:
 ASSERT:read-your-writes-sql:PASS
 ASSERT:probe-cleaned:PASS
 ```
+
+## Proof 5: `scripts/05-one-plan.sql`
+
+**Article claim: one cost-based optimizer produces a single plan spanning
+graph, document, vector, and relational.** `EXPLAIN PLAN` captures the plan for
+one statement that walks the referral graph (`GRAPH_TABLE`), joins relational
+`CUSTOMERS`, anti-joins a document-model predicate on the `EVENTS` JSON
+collection (`NOT EXISTS` on `e.data.type.string()`), and orders by
+`VECTOR_DISTANCE` over `SUPPORT_TICKETS`. The assertions then interrogate
+`PLAN_TABLE`: every model appears as an **ordinary row source in one plan
+tree**. That is the proof — Oracle translates `GRAPH_TABLE` internally to
+equivalent SQL, so the graph shows up as a plain `VIEW` (`CUSTOMER_GRAPH`)
+reading the `REFERRALS` edge table through its primary-key index, costed by the
+same optimizer that plans the joins, the JSON predicate, and the vector sort.
+One cost model. No federation seam. In a polyglot stack there is no such plan,
+because no component can see across the wire.
+
+(The `REFERRALS` index name is system-generated, so the graph assertion
+resolves it through `user_indexes` rather than hard-coding it. `EXPLAIN PLAN`
+rows are transactional, so the harness rollback leaves `PLAN_TABLE` empty.)
+
+Expected assertions:
+
+```
+ASSERT:plan-captured:PASS
+ASSERT:plan-spans-graph:PASS
+ASSERT:plan-spans-relational:PASS
+ASSERT:plan-spans-document:PASS
+ASSERT:plan-spans-vector:PASS
+ASSERT:one-plan-tree:PASS
+```
+
+With proof 5 the module emits **20 assertions across five scripts**.
 
 ---
 
