@@ -13,6 +13,27 @@ RUN printf '[mongodb-org-8.0]\nname=MongoDB Repository\nbaseurl=https://repo.mon
  && microdnf install -y mongodb-mongosh \
  && microdnf clean all
 
+# Bake Oracle's prebuilt augmented all-MiniLM-L12-v2 ONNX model into the image so
+# every fresh build (and CI) loads identical in-DB embeddings deterministically —
+# no network dependency at init time. This is the official model published by
+# Oracle Machine Learning: the 26ai docs "ONNX Pipeline Models: Text Embedding"
+# page redirects (/pls/topic/lookup?...&id=oml_ai_models_object_storage) to the
+# OML-ai-models object-storage bucket whose index lists this exact URL. The zip
+# (~122.6 MB) unpacks to all_MiniLM_L12_v2.onnx (~133.3 MB, 384-dim output),
+# loaded by docker/init/08-vector-model.sql via DBMS_VECTOR.LOAD_ONNX_MODEL.
+# Placed AFTER the ORDS + mongosh layers so their (slow) cache layers are reused
+# when only the model layer changes. Fails the build loudly if the URL stops
+# resolving rather than baking a broken image.
+ARG MINILM_URL=https://adwc4pm.objectstorage.us-ashburn-1.oci.customer-oci.com/p/TtH6hL2y25EypZ0-rrczRZ1aXp7v1ONbRBfCiT-BDBN8WLKQ3lgyW6RxCfIFLdA6/n/adwc4pm/b/OML-ai-models/o/all_MiniLM_L12_v2_augmented.zip
+RUN microdnf install -y unzip \
+ && microdnf clean all \
+ && mkdir -p /opt/oracle/models \
+ && curl -fsSL -o /tmp/minilm.zip "$MINILM_URL" \
+ && unzip -o /tmp/minilm.zip -d /opt/oracle/models \
+ && test -s /opt/oracle/models/all_MiniLM_L12_v2.onnx \
+ && rm -f /tmp/minilm.zip \
+ && chown -R oracle:oinstall /opt/oracle/models
+
 COPY init/ /container-entrypoint-initdb.d/
 
 COPY scripts/entrypoint.sh /opt/oracle/scripts/entrypoint.sh
