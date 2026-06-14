@@ -47,10 +47,10 @@ WHERE SDO_WITHIN_DISTANCE(
         SDO_GEOMETRY(2001, 4326, SDO_POINT_TYPE(-97.7431, 30.2672, NULL), NULL, NULL),
         'distance=50 unit=KM') = 'TRUE';
 
-SELECT /* a wider 400 km radius from the same probe reaches San Antonio and
-          Houston too (3 Texas metros), but still not Dallas (~290 km is inside
-          400, so Frisco/Dallas joins) — five located stores, all but Online,
-          fall inside 400 km of central Texas. Confirms distance scales sanely. */
+SELECT /* a wider 400 km radius from the same probe reaches San Antonio (Pearl,
+          ~116 km), Houston (Galleria, ~228 km) and Dallas (Frisco, ~331 km) too
+          — all five located stores fall inside 400 km of central Texas; only the
+          null-location Online store is excluded. Confirms distance scales sanely. */
        'ASSERT:point-radius-wide-count:' ||
        CASE WHEN COUNT(*) = 5 THEN 'PASS' ELSE 'FAIL' END
 FROM stores s
