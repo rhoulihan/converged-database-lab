@@ -3,9 +3,11 @@ ALTER SESSION SET CONTAINER = FREEPDB1;
 -- In-database embeddings infrastructure (foundational; used by the AI articles).
 -- Runs once on first boot (gvenzl initdb), after 01-07. Loads Oracle's prebuilt
 -- augmented all-MiniLM-L12-v2 ONNX model (baked into the image at /opt/oracle/models
--- by docker/Dockerfile.oracle), embeds all 300 ticket bodies into a real VECTOR(384)
--- column, and builds an IVF vector index on it. Idempotent: every CREATE is guarded
--- so a recreated container over a persistent volume re-runs cleanly.
+-- by docker/Dockerfile.oracle), embeds all 10,000 ticket bodies into a real
+-- VECTOR(384) column, builds an IVF vector index on it, and gathers optimizer
+-- stats so the CBO's index-vs-scan choice is deterministic. Idempotent: every
+-- CREATE is guarded so a recreated container over a persistent volume re-runs
+-- cleanly.
 --
 -- Grants used by the AI modules beyond the base 01-lab-user.sql set:
 --   CREATE MINING MODEL  — DBMS_VECTOR.LOAD_ONNX_MODEL registers an ONNX model
@@ -59,8 +61,9 @@ BEGIN
 END;
 /
 
--- Embed all 300 ticket bodies in-database — no external embedding service, no
--- copy pipeline. ~2.5s on the Free container. Re-runnable: recomputes from body.
+-- Embed all 10,000 ticket bodies in-database — no external embedding service, no
+-- copy pipeline. ~3 min on the Free container (~55 embeddings/s, single-threaded).
+-- Re-runnable: recomputes from body.
 UPDATE support_tickets SET body_vec = VECTOR_EMBEDDING(MINILM_L12 USING body AS data);
 
 COMMIT;
@@ -77,3 +80,18 @@ END;
 CREATE VECTOR INDEX tickets_bodyvec_ivf ON support_tickets(body_vec)
   ORGANIZATION NEIGHBOR PARTITIONS
   DISTANCE COSINE;
+
+-- Fresh optimizer statistics on the tables module 03's filtered-ANN plan spans.
+-- Load-bearing for determinism: without stats the CBO's dynamic sampling can pick
+-- the IVF plan even at toy sizes; with stats the choice is honestly cost-based —
+-- full-scan exact distance at hundreds of rows, the IVF index + in-plan filter
+-- predicates at 10,000 (the crossover arrives by roughly 3,000 rows on the
+-- Free container).
+-- (schema named explicitly: this script runs as SYS with CURRENT_SCHEMA=lab_user,
+-- and DBMS_STATS resolves USER to the logon user, not the current schema)
+BEGIN
+  DBMS_STATS.GATHER_TABLE_STATS('LAB_USER', 'SUPPORT_TICKETS');
+  DBMS_STATS.GATHER_TABLE_STATS('LAB_USER', 'CUSTOMERS');
+  DBMS_STATS.GATHER_TABLE_STATS('LAB_USER', 'ORDERS');
+END;
+/

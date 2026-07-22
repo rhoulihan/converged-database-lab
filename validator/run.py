@@ -76,7 +76,10 @@ def run_sql(path, conn):
     return asserts, errors
 
 def run_js(path):
-    cmd = ["docker", "exec", "-i", "lab-oracle", "mongosh", "--quiet", MONGO_URI,
+    # CONTAINER_ENGINE=podman for hosts where docker is not permitted (e.g. Oracle
+    # laptops); CI keeps the docker default.
+    engine = os.environ.get("CONTAINER_ENGINE", "docker")
+    cmd = [engine, "exec", "-i", "lab-oracle", "mongosh", "--quiet", MONGO_URI,
            "--file", "/dev/stdin"]
     with open(path, "rb") as fh:
         proc = subprocess.run(cmd, stdin=fh, capture_output=True, text=True, timeout=300)
