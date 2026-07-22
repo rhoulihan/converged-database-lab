@@ -40,8 +40,8 @@ DECLARE /* the whole capture / update+commit / re-measure / restore+commit cycle
   v_before_rank NUMBER;
   v_after_rank  NUMBER;
 BEGIN
-  /* probe: a paraphrase of ticket #1's "Login fails ... after reset" body — no
-     shared keywords, pure semantic match */
+  /* probe: a paraphrase, not a copy, of ticket #1's "Login fails ... after
+     reset" body — the match is semantic, not verbatim */
   SELECT VECTOR_EMBEDDING(MINILM_L12 USING 'cannot access my account login error' AS data)
     INTO v_qv FROM dual;
 

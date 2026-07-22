@@ -20,7 +20,7 @@ DECLARE /* Module 03 proof 3: the SAME vector query, run by two tenants, returns
    within one session via DBMS_SESSION.SET_CONTEXT. The query is byte-for-byte
    identical across both; only the governed identity differs — which is exactly
    the point. Tenant A owns even-numbered customers' tickets, tenant B owns the
-   odd-numbered ones; the sets are disjoint and partition all 300 tickets.
+   odd-numbered ones; the sets are disjoint and partition all 10,000 tickets.
 
    DDL / TEARDOWN EXCEPTION: this proof creates a context, a context-setter
    procedure, a policy-predicate function, and a DBMS_RLS policy — all DDL, all
@@ -139,6 +139,6 @@ SELECT /* nothing module-local survives: no policy, no predicate function, no
        CASE WHEN (SELECT COUNT(*) FROM user_policies WHERE policy_name='M03_TENANT_POL') = 0
              AND (SELECT COUNT(*) FROM user_objects
                   WHERE object_name IN ('M03_TENANT_PRED','M03_SET_TENANT','M03_PERM_PROOF')) = 0
-             AND (SELECT COUNT(*) FROM support_tickets) = 300
+             AND (SELECT COUNT(*) FROM support_tickets) = 10000
             THEN 'PASS' ELSE 'FAIL' END
 FROM dual;

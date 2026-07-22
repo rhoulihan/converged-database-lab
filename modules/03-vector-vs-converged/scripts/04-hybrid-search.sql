@@ -15,7 +15,7 @@ DECLARE /* Module 03 proof 4: ONE engine, ONE index, ONE call fuses keyword and
    in application SQL because BM25 and vector scores are "incommensurable"
    (ParadeDB's own framing); Pinecone's sparse-dense scores "are not normalized
    to the dense vector range," so the app must weight and rerank; MongoDB's
-   $rankFusion is Preview (8.0+). Here the fusion is one call: the HVI computes
+   $rankFusion is Preview (8.1+). Here the fusion is one call: the HVI computes
    BOTH a vector_score and a text_score per row and returns a single fused,
    ranked result set.
 
