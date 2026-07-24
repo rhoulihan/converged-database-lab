@@ -1,5 +1,14 @@
 # converged-database-lab
 
+> **📌 This repo has moved for publication.** The canonical home of this lab — the
+> one the published articles link — is the Oracle repo:
+> **[oracle-devrel/oracle-umt-developer-hub](https://github.com/oracle-devrel/oracle-umt-developer-hub)**,
+> under [`labs/converged-database-lab`](https://github.com/oracle-devrel/oracle-umt-developer-hub/tree/main/labs/converged-database-lab),
+> with the same per-article branches (`article/02-…` … `article/06-…`). This
+> personal repo remains a working/development mirror only; lab changes land here
+> first for iteration, then are imported to the hub for publication. If you got
+> here from an article, use the hub.
+
 ![validate](https://github.com/rhoulihan/converged-database-lab/actions/workflows/validate.yml/badge.svg)
 
 Runnable proofs for the converged-database article series — every technical claim in the articles executes here, nightly, against a free container.
@@ -91,15 +100,15 @@ All modules run against one deterministically seeded domain. Seeds use an LCG (s
 
 ## Modules
 
-| # | Slug | Status | Proofs | Assertions | Links |
-|---|------|--------|--------|------------|-------|
-| 01 | `what-is-a-converged-database` | Live | 4 | 14 | [README](modules/01-what-is-a-converged-database/README.md) · article link lands at publish |
-| 02 | `converged-vs-multi-model` | Arrives with its article | — | — | — |
-| 03 | `vector-db-vs-converged` | Arrives with its article | — | — | — |
-| 04 | `ai-agents-enterprise-data` | Arrives with its article | — | — | — |
-| 05 | `json-graph-vector-relational-one-db` | Arrives with its article | — | — | — |
-| 06 | `polyglot-vs-converged` | Arrives with its article | — | — | — |
-| 07 | `reading-stonebraker-and-pavlo` | Arrives with its article | — | — | — |
+The authoritative module map — statuses, published-article links, per-branch READMEs —
+lives in the [hub's lab README](https://github.com/oracle-devrel/oracle-umt-developer-hub/blob/main/labs/converged-database-lab/README.md).
+What is on **this repo's `main`** right now:
+
+| # | Slug | Status here | Proofs | Assertions | Links |
+|---|------|-------------|--------|------------|-------|
+| 01 | `what-is-a-converged-database` | On main | 5 | 20 | [README](modules/01-what-is-a-converged-database/README.md) · [published article](https://blogs.oracle.com/developers/what-is-a-converged-database-definition-five-tests-and-ai-use-cases) |
+| 03 | `vector-vs-converged` | On main (10K corpus, IVF filter-first proof, HVI) | 4 | 23 | [README](modules/03-vector-vs-converged/README.md) · article in draft |
+| 02, 04–06 | see per-article `article/NN-*` branches | dev branches here; modules 01–03 are live on the [hub's main](https://github.com/oracle-devrel/oracle-umt-developer-hub/tree/main/labs/converged-database-lab) | — | — | — |
 
 ---
 
