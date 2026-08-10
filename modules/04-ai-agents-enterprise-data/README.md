@@ -16,6 +16,18 @@ transaction, one governance domain:
    on every read.
 3. **Audit** — every agent query in one attributed, tamper-resistant trail.
 
+Proofs 4-6 take the second half of the story — Jeremy Daly's "Context Is a
+Projection" — and show that memory is a multimodel access-pattern problem, not a
+vector-database problem, over one canonical store:
+
+4. **Projection** — one canonical memory projected into an application-ready
+   context document by a JSON Relational Duality View (context is a projection).
+5. **Recall** — JSON-scoped, temporal, and vector recall as different access
+   patterns over that same store ("what did we decide last week? what did we
+   believe before we changed our minds?").
+6. **Explainability** — provenance and relationship traversal over the same
+   memory: "why do you believe that?"
+
 Every script executes against the live lab container and emits machine-checkable
 assertions (`ASSERT:<name>:PASS|FAIL`). No screenshots, no trust-me. The semantic
 tier and the retrievals run on **real 384-dimension embeddings generated inside
@@ -184,6 +196,61 @@ to the least-privileged `lab_user` and is **not needed** here.
 
 ---
 
+## Proof 4: `scripts/04-context-is-a-projection.sql`
+
+**Article claim: context is a projection, not a copy.** An agent's context window is
+not its memory; it is a purpose-built projection of persistent memory for the
+question at hand (UMT: model once, project many ways). This proof builds ONE
+canonical memory for session `sess-atlas` — a superseded belief, the decision that
+replaced it, a fact, an unrelated project's decision, and a related risk — each row
+carrying **relational** ownership (`session_id`), a **native JSON** retrieval scope,
+**temporal** validity (`valid_from`/`valid_to`/`superseded_by`), a real in-DB
+`VECTOR(384)` embedding, and **provenance** to a source. A **JSON Relational Duality
+View** (`mem_context_dv`) then projects that canonical memory into one
+application-ready context document — statement + scope + provenance — generated, not
+stored: "pick up where we left off" is a single read of the view. Assertions:
+
+```
+ASSERT:context-projection-assembles:PASS          (duality view assembles the context doc)
+ASSERT:scope-is-json-ownership-is-relational:PASS  ("who may see this" relational; "when relevant" JSON)
+```
+
+## Proof 5: `scripts/05-scoped-and-temporal-recall.sql`
+
+**Article claim: memory is a multimodel access-pattern problem, not a vector-database
+problem.** Over the same `sess-atlas` memory, three different access patterns:
+JSON-scope-constrained vector recall ("what do you remember about Project Atlas?" —
+the semantically-similar Zephyr/MongoDB memory is filtered out by scope before
+ranking), a scope + temporal + relational filter ("what did we decide last week?" →
+the current Oracle decision), and temporal history ("what did we believe before we
+changed our minds?" → the superseded Postgres belief, still recoverable). Assertions:
+
+```
+ASSERT:scoped-vector-recall:PASS
+ASSERT:scoped-temporal-decision:PASS
+ASSERT:superseded-belief-recoverable:PASS
+```
+
+## Proof 6: `scripts/06-why-do-you-believe-that.sql`
+
+**Article claim: explainability falls out of the model.** Because the canonical
+memory keeps `source → memory → related memory`, "why do you believe that?" and
+"what else is related?" are graph traversals over the same rows — no separate lineage
+store. This proof traces the Oracle decision back to the conversation it was derived
+from, hops to the related risk, and verifies the full source→memory→related chain,
+then **tears down** the shared proofs-4-6 fixture. Assertions:
+
+```
+ASSERT:provenance-trace-to-source:PASS
+ASSERT:related-memory-traversal:PASS
+ASSERT:explainability-chain-intact:PASS
+ASSERT:projection-teardown-clean:PASS
+```
+
+> Proofs 4-6 share one canonical memory (created + committed in proof 4, torn down in
+> proof 6) — the faithful representation of "one memory, many projections." The
+> validator runs scripts in lexical order, so the shared fixture is present for 5 and 6.
+
 ## Described and cited (not CI-built)
 
 **Select AI Agent (`DBMS_CLOUD_AI_AGENT`).** The article describes Oracle's
@@ -222,4 +289,4 @@ number of times with identical results. The only persistent residue is the
 append-only audit-trail rows from proof 3, scoped to a per-run nonce and harmless
 by design.
 
-This module emits **16 assertions across three scripts** (7 + 4 + 5).
+This module emits **25 assertions across six scripts** (7 + 4 + 5 + 2 + 3 + 4).
