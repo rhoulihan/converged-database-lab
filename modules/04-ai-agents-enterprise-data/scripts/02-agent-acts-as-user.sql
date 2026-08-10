@@ -142,6 +142,30 @@ SELECT /* parity-correctness: alice's rows really are even-customer tickets and
             THEN 'PASS' ELSE 'FAIL' END
 FROM dual;
 
+-- Plan evidence: the acting-user predicate is folded by the ENGINE into the plan
+-- of the agent's vector retrieval — the agent's SQL never named customer_id, yet
+-- the security predicate (with the SYS_CONTEXT acting identity) is applied on the
+-- scan. This is what "the agent cannot phrase its way around it" means, at the plan.
+BEGIN m04_set_acting_user('alice'); END;
+/
+
+DELETE FROM plan_table;
+
+EXPLAIN PLAN FOR
+SELECT ticket_id FROM support_tickets
+ORDER BY VECTOR_DISTANCE(body_vec,
+           VECTOR_EMBEDDING(MINILM_L12 USING 'refund for a damaged package' AS data),
+           COSINE)
+FETCH APPROX FIRST 10 ROWS ONLY WITH TARGET ACCURACY 90;
+
+SELECT 'ASSERT:vpd-predicate-folded-into-plan:' ||
+       CASE WHEN EXISTS (SELECT 1 FROM plan_table
+                         WHERE object_name = 'SUPPORT_TICKETS'
+                           AND UPPER(filter_predicates) LIKE '%ACTING_USER%'
+                           AND UPPER(filter_predicates) LIKE '%CUSTOMER_ID%')
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;
+
 DECLARE /* teardown: drop policy, predicate function, setter, context, capture
    table — all autocommitted DDL, so it must be explicit. The validator's
    rollback afterward has nothing of ours left to undo. */

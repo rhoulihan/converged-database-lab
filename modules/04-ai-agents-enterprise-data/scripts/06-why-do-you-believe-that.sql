@@ -41,6 +41,24 @@ SELECT /* the full explainability chain is intact end to end: from the source,
             THEN 'PASS' ELSE 'FAIL' END
 FROM dual;
 
+-- PLAN EVIDENCE: the GRAPH_TABLE traversal compiles to relational JOINS over the
+-- same canonical tables, keyed on memory_id / source_id — one store, one optimizer,
+-- no separate graph engine and no copy of the memory.
+DELETE FROM plan_table;
+EXPLAIN PLAN FOR
+SELECT ref FROM GRAPH_TABLE (mem_graph
+  MATCH (m IS memory) -[e IS derived_from]-> (s IS source)
+  WHERE m.memory_id = 'M2'
+  COLUMNS (s.ref AS ref));
+
+SELECT 'ASSERT:graph-compiles-to-relational-joins:' ||
+       CASE WHEN EXISTS (SELECT 1 FROM plan_table
+                         WHERE UPPER(operation) LIKE '%JOIN%' OR UPPER(operation) = 'NESTED LOOPS')
+             AND EXISTS (SELECT 1 FROM plan_table WHERE UPPER(access_predicates) LIKE '%SOURCE_ID%')
+             AND EXISTS (SELECT 1 FROM plan_table WHERE UPPER(access_predicates) LIKE '%MEMORY_ID%')
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;
+
 DECLARE /* TEARDOWN of the shared proofs-4-6 fixture: drop the duality view, the
    property graph and every module-local table; the seed was committed, so this is
    explicit (autocommitting DDL). Leaves the domain exactly as proofs 1-3 found it. */

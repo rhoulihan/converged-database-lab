@@ -52,3 +52,63 @@ SELECT /* "What did we BELIEVE before we changed our minds?" — temporal histor
                     AND superseded_by IS NOT NULL) LIKE '%Postgres%'
             THEN 'PASS' ELSE 'FAIL' END
 FROM dual;
+
+-- ---------------------------------------------------------------------------
+-- PLAN EVIDENCE (proof, not assertion by adjective): on the scaled memory
+-- (proof 4 loads 4,000 filler rows + gathers stats) each recall is an INDEX
+-- RANGE SCAN whose Predicate Information shows the ENGINE applying the scope /
+-- temporal / history condition — access() on the index key, filter() for the
+-- rest. Run the query yourself with EXPLAIN PLAN to see the same output.
+-- ---------------------------------------------------------------------------
+DELETE FROM plan_table;
+EXPLAIN PLAN FOR
+SELECT memory_id FROM mem_memory
+WHERE session_id = 'sess-atlas'
+  AND JSON_VALUE(scope, '$.project') = 'Atlas'
+ORDER BY VECTOR_DISTANCE(embedding,
+           VECTOR_EMBEDDING(MINILM_L12 USING 'what storage database will Project Atlas use' AS data),
+           COSINE)
+FETCH FIRST 1 ROWS ONLY;
+
+SELECT 'ASSERT:scoped-recall-index-range-scan:' ||
+       CASE WHEN EXISTS (SELECT 1 FROM plan_table
+                         WHERE operation = 'INDEX' AND options = 'RANGE SCAN'
+                           AND UPPER(access_predicates) LIKE '%SESSION_ID%')
+             AND EXISTS (SELECT 1 FROM plan_table
+                         WHERE UPPER(filter_predicates) LIKE '%JSON_VALUE%'
+                           AND UPPER(filter_predicates) LIKE '%''ATLAS''%')
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;
+
+DELETE FROM plan_table;
+EXPLAIN PLAN FOR
+SELECT memory_id FROM mem_memory
+WHERE session_id = 'sess-atlas' AND kind = 'decision'
+  AND JSON_VALUE(scope, '$.project') = 'Atlas'
+  AND valid_from >= SYSTIMESTAMP - INTERVAL '7' DAY
+  AND (valid_to IS NULL OR valid_to > SYSTIMESTAMP);
+
+SELECT 'ASSERT:scoped-temporal-index-range-scan:' ||
+       CASE WHEN EXISTS (SELECT 1 FROM plan_table
+                         WHERE operation = 'INDEX' AND options = 'RANGE SCAN'
+                           AND UPPER(access_predicates) LIKE '%KIND%')
+             AND EXISTS (SELECT 1 FROM plan_table
+                         WHERE UPPER(NVL(access_predicates,' ')||NVL(filter_predicates,' ')) LIKE '%VALID_FROM%')
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;
+
+DELETE FROM plan_table;
+EXPLAIN PLAN FOR
+SELECT statement FROM mem_memory
+WHERE session_id = 'sess-atlas'
+  AND JSON_VALUE(scope, '$.project') = 'Atlas'
+  AND superseded_by IS NOT NULL;
+
+SELECT 'ASSERT:superseded-index-range-scan:' ||
+       CASE WHEN EXISTS (SELECT 1 FROM plan_table
+                         WHERE operation = 'INDEX' AND options = 'RANGE SCAN'
+                           AND UPPER(access_predicates) LIKE '%SESSION_ID%')
+             AND EXISTS (SELECT 1 FROM plan_table
+                         WHERE UPPER(filter_predicates) LIKE '%SUPERSEDED_BY%')
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;

@@ -128,6 +128,7 @@ Expected assertions:
 ASSERT:both-identities-nonempty:PASS
 ASSERT:identities-disjoint:PASS
 ASSERT:governed-as-user:PASS
+ASSERT:vpd-predicate-folded-into-plan:PASS   (plan: the acting-user predicate, with SYS_CONTEXT, is folded into the retrieval scan)
 ASSERT:teardown-clean:PASS
 ```
 
@@ -213,6 +214,7 @@ stored: "pick up where we left off" is a single read of the view. Assertions:
 ```
 ASSERT:context-projection-assembles:PASS          (duality view assembles the context doc)
 ASSERT:scope-is-json-ownership-is-relational:PASS  ("who may see this" relational; "when relevant" JSON)
+ASSERT:projection-expands-to-base-tables:PASS      (plan: the duality read expands to index access on the base tables)
 ```
 
 ## Proof 5: `scripts/05-scoped-and-temporal-recall.sql`
@@ -229,7 +231,13 @@ changed our minds?" → the superseded Postgres belief, still recoverable). Asse
 ASSERT:scoped-vector-recall:PASS
 ASSERT:scoped-temporal-decision:PASS
 ASSERT:superseded-belief-recoverable:PASS
+ASSERT:scoped-recall-index-range-scan:PASS         (plan: INDEX RANGE SCAN on session; JSON scope as filter)
+ASSERT:scoped-temporal-index-range-scan:PASS       (plan: access on session+kind; temporal window as filter)
+ASSERT:superseded-index-range-scan:PASS            (plan: access on session; superseded_by as filter)
 ```
+
+Proof 5 scales the memory (~4,000 filler rows + gathered stats) so these are real
+index range scans, not full scans on a handful of rows.
 
 ## Proof 6: `scripts/06-why-do-you-believe-that.sql`
 
@@ -244,6 +252,7 @@ then **tears down** the shared proofs-4-6 fixture. Assertions:
 ASSERT:provenance-trace-to-source:PASS
 ASSERT:related-memory-traversal:PASS
 ASSERT:explainability-chain-intact:PASS
+ASSERT:graph-compiles-to-relational-joins:PASS     (plan: GRAPH_TABLE → nested-loop joins keyed on memory_id/source_id)
 ASSERT:projection-teardown-clean:PASS
 ```
 
@@ -289,4 +298,10 @@ number of times with identical results. The only persistent residue is the
 append-only audit-trail rows from proof 3, scoped to a per-run nonce and harmless
 by design.
 
-This module emits **25 assertions across six scripts** (7 + 4 + 5 + 2 + 3 + 4).
+This module emits **31 assertions across six scripts** (7 + 5 + 5 + 3 + 6 + 5). Proofs
+2, 4, 5, and 6 include **EXPLAIN-PLAN predicate assertions** — they run `EXPLAIN PLAN`
+and assert on the `plan_table` access/filter predicates, so every claim about *how* the
+engine applies a scope, temporal, security, or join condition is graded, not asserted by
+adjective. Proof 5 scales the canonical memory to ~4,000 rows and gathers stats first, so
+the selective predicates resolve to **index range scans** whose Predicate Information
+shows the condition on the index key.

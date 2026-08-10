@@ -58,6 +58,12 @@ CREATE TABLE mem_relate (                  -- memory -> relates to -> memory
   rel      VARCHAR2(40),
   PRIMARY KEY (from_mem, to_mem));
 
+-- Indexes so the selective recall/temporal/history predicates become INDEX RANGE
+-- SCANS at book scale (proof 5 asserts the access path on scaled data below).
+CREATE INDEX ix_mem_session       ON mem_memory (session_id);
+CREATE INDEX ix_mem_sess_kind_vf  ON mem_memory (session_id, kind, valid_from);
+CREATE INDEX ix_mem_sess_supers   ON mem_memory (session_id, superseded_by);
+
 -- one property graph over the same canonical rows: provenance + relationships
 CREATE PROPERTY GRAPH mem_graph
   VERTEX TABLES (
@@ -135,6 +141,29 @@ BEGIN
 END;
 /
 
+DECLARE /* SCALE: bulk filler memories across many sessions/projects so the CBO
+   chooses INDEX RANGE SCANS for the selective sess-atlas / Atlas predicates rather
+   than full scans. One embedding is reused for all filler (its vector value is
+   irrelevant — filler is out of scope for the Atlas probe), so this stays fast.
+   Then gather stats so the optimizer sees the true selectivity. */
+  v_emb VECTOR(384, FLOAT32);
+BEGIN
+  SELECT VECTOR_EMBEDDING(MINILM_L12 USING 'filler memory' AS data) INTO v_emb FROM dual;
+  INSERT INTO mem_memory
+  SELECT 'F' || LEVEL,
+         'sess-' || LPAD(MOD(LEVEL,200), 4, '0'),
+         CASE MOD(LEVEL,4) WHEN 0 THEN 'belief' WHEN 1 THEN 'decision'
+                           WHEN 2 THEN 'fact'   ELSE 'risk' END,
+         'filler memory ' || LEVEL,
+         JSON('{"project":"P' || MOD(LEVEL,50) || '","topic":"t"}'),
+         SYSTIMESTAMP - NUMTODSINTERVAL(MOD(LEVEL,365), 'DAY'), NULL, NULL,
+         v_emb
+  FROM   dual CONNECT BY LEVEL <= 4000;
+  COMMIT;
+  DBMS_STATS.GATHER_TABLE_STATS(USER, 'MEM_MEMORY');
+END;
+/
+
 SELECT /* CONTEXT AS PROJECTION: the duality view assembles canonical memory M2 into
    one application-ready context document — statement + native JSON scope + its
    provenance (the source it was derived from) — generated, not stored. This is
@@ -154,5 +183,18 @@ SELECT /* the same canonical row is reachable as flexible JSON scope AND as a
        CASE WHEN (SELECT COUNT(*) FROM mem_memory
                   WHERE session_id = 'sess-atlas'                     -- relational security
                     AND JSON_VALUE(scope, '$.project') = 'Atlas') = 4 -- flexible JSON scope
+            THEN 'PASS' ELSE 'FAIL' END
+FROM dual;
+
+-- PLAN EVIDENCE: the context document is GENERATED, not stored — reading the
+-- duality view expands into index access over the canonical base tables
+-- (mem_memory root + mem_source), assembled at read time, keyed by their PKs.
+DELETE FROM plan_table;
+EXPLAIN PLAN FOR SELECT data FROM mem_context_dv WHERE json_value(data, '$._id') = 'M2';
+
+SELECT 'ASSERT:projection-expands-to-base-tables:' ||
+       CASE WHEN (SELECT COUNT(DISTINCT object_name) FROM plan_table
+                  WHERE object_name IN ('MEM_MEMORY','MEM_SOURCE')) = 2
+             AND EXISTS (SELECT 1 FROM plan_table WHERE UPPER(access_predicates) LIKE '%MEMORY_ID%')
             THEN 'PASS' ELSE 'FAIL' END
 FROM dual;
