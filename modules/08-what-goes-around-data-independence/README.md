@@ -84,15 +84,40 @@ whole module. The validator can run back to back with no leftovers.
 Creates the `m08_meter` package and the `m08_metrics` session table that the
 later scripts use to measure work. Safe to run more than once.
 
-- `m08_meter.snap` remembers the session's current counters.
-- `m08_meter.delta('session logical reads' | 'redo size' | 'execute count')`
-  returns how much that counter grew since the last `snap`.
+- `m08_meter.snap` remembers the session's current counters and the clock.
+- `m08_meter.delta('session logical reads' | 'redo size' | 'execute count' |
+  'CPU used by this session' | 'elapsed time')` returns how much that counter
+  grew since the last `snap`. CPU and elapsed time are in centiseconds
+  (hundredths of a second).
+- `m08_meter.elapsed_cs` returns the centiseconds since the last `snap`.
 - `m08_meter.record(name, value)` stores a named measurement.
+- `m08_meter.measure_repeat(p_name, p_sql, p_runs => 20)` measures one query
+  many times:
+  - It runs the query once to warm it up, so parsing and the first execution
+    are never measured. Then it runs it `p_runs` more times.
+  - Each run executes the query and fetches every row, 1,000 rows per fetch
+    call (like a client with an array size of 1,000), so the cost of reading the
+    rows is real. LOB columns come back as pointers, so a query that must read a
+    document's bytes should select `json_serialize(... returning blob)`.
+  - The meter's own cost (a `snap` and its deltas with no work in between) is
+    measured once per call and subtracted, never going below 0.
+  - It records `<p_name>-reads-median`, `-reads-max`, `-reads-min`,
+    `-cpu-cs-median`, `-cpu-cs-max`, `-elapsed-cs-median` and
+    `-elapsed-cs-max`. With an even number of runs the median is the lower of
+    the two middle values, so it is always a run that really happened.
+
+Logical reads are exact and repeat run to run. CPU and elapsed time are not:
+they are measured on a single Free container that is shared with everything
+else on the host, so they are noisy and only accurate to one centisecond. That
+is why the helper reports the median over 20 runs together with the min or
+max, instead of a single run.
 
 Expected assertions:
 
 ```
 ASSERT:m08-meter-ready:PASS
+ASSERT:m08-meter-cpu-ready:PASS
+ASSERT:m08-meter-repeat-ready:PASS
 ```
 
 ## Proofs
