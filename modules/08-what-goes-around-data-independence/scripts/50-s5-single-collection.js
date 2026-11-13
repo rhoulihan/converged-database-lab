@@ -41,19 +41,37 @@ for (const o of ORDERS) {
 }
 col.insertMany(docs);
 
-// The read: exactly one request per order.
-let requests = 0;
-const readOrder = (pk) => { requests++; return col.find({ pk: pk }).sort({ sk: 1 }).toArray(); };
+// The read: one find command per order, issued as a raw command so the wire
+// requests can be counted. A cursor id of 0 in the reply means the server
+// returned everything and closed the cursor; otherwise each getMore is one
+// more request.
+const cursorDone = (id) => id === undefined || id === null || String(id) === '0';
 const results = {};
+const firstBatchSize = {};
+const firstReplyDone = {};
 const requestsPerOrder = {};
 for (const o of ORDERS) {
-  const before = requests;
-  results[o.n] = readOrder(pkOf(o.n));
-  requestsPerOrder[o.n] = requests - before;
+  const reply = db.runCommand({ find: NAME, filter: { pk: pkOf(o.n) }, sort: { sk: 1 } });
+  const docsOut = reply.cursor.firstBatch.slice();
+  firstBatchSize[o.n] = docsOut.length;
+  firstReplyDone[o.n] = cursorDone(reply.cursor.id);
+  let requests = 1;
+  let id = reply.cursor.id;
+  while (!cursorDone(id) && requests < 100) {
+    const more = db.runCommand({ getMore: id, collection: NAME });
+    requests++;
+    docsOut.push(...more.cursor.nextBatch);
+    id = more.cursor.id;
+  }
+  results[o.n] = docsOut;
+  requestsPerOrder[o.n] = requests;
 }
 
-// s5-one-find-returns-all: one find returns the header plus all k lines.
-const okAll = ORDERS.every((o) => requestsPerOrder[o.n] === 1 && results[o.n].length === 1 + o.k);
+// s5-one-find-returns-all: for every order, the first reply to one find
+// holds the header plus all k lines, and the cursor is already exhausted.
+const okAll = ORDERS.every((o) => firstBatchSize[o.n] === 1 + o.k && firstReplyDone[o.n]);
+ORDERS.forEach((o) => print('order ' + pkOf(o.n) + ': firstBatch=' + firstBatchSize[o.n] +
+  ' exhausted=' + firstReplyDone[o.n] + ' requests=' + requestsPerOrder[o.n]));
 print('ASSERT:s5-one-find-returns-all:' + (okAll ? 'PASS' : 'FAIL'));
 
 // s5-types: exactly one order header and k lines.
@@ -91,7 +109,7 @@ const okNoCross = ORDERS.every((o) =>
   results[o.n].length > 0 && results[o.n].every((d) => d.pk === pkOf(o.n) && d._id.startsWith(pkOf(o.n))));
 print('ASSERT:s5-no-cross-talk:' + (okNoCross ? 'PASS' : 'FAIL'));
 
-print('METRIC:s5-requests:' + requestsPerOrder[9]);
+print('METRIC:s5-requests:' + Math.max(...ORDERS.map((o) => requestsPerOrder[o.n])));
 print('METRIC:s5-docs-returned-k25:' + results[9].length);
 
 col.drop();

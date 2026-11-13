@@ -389,18 +389,26 @@ item collection. The sort key puts the header first, because `#` sorts before
 index on `{pk: 1, sk: 1}` finds the item collection.
 
 The script seeds 3 orders with 5, 10 and 25 lines, inserted out of order and
-interleaved across orders. It then reads each order with one request:
-`find({pk: "ORD#7"}).sort({sk: 1})`.
+interleaved across orders. It then reads each order with one find command,
+`{find: "m08s5_single", filter: {pk: "ORD#7"}, sort: {sk: 1}}`, sent as a raw
+command so the script can see the server's reply. The reply carries a cursor
+id. An id of 0 means the server sent every document in that first reply and
+closed the cursor, so no follow-up request (getMore) is needed.
 
 **What it proves.**
 
-- **One request, the whole order.** Each find returns the header and every
-  line, already in order. The app does no join and no multi-get.
+- **One request, the whole order.** For every order, the first reply to one
+  find holds the header and every line, already in order, and its cursor id is
+  0. The app does no join and no multi-get.
 - **The database does the work.** The plan reads the `{pk, sk}` index by range
-  scan; nothing scans the whole table. The API sorts the result on `sk`, so the
-  order does not depend on how the documents were written.
-- **Items stay separate.** Each line is its own document, so it can be
-  inserted, changed or deleted on its own, without rewriting the order.
+  scan; nothing scans the whole table. The index locates the item collection,
+  and a separate sort step in the database orders it: the plan is a multivalue
+  index range scan followed by a sort on `sk`. The result order does not depend
+  on how the documents were written.
+
+Because each line is its own document, it can also be inserted, changed or
+deleted on its own, without rewriting the order. S5 does not check that; it is
+a property of the layout.
 
 Expected assertions:
 
@@ -413,8 +421,8 @@ ASSERT:s5-no-cross-talk:PASS
 ASSERT:s5-teardown-clean:PASS
 ```
 
-- `s5-one-find-returns-all`: for each of the 3 orders, one request returns
-  1 + k documents.
+- `s5-one-find-returns-all`: for each of the 3 orders, the first reply to one
+  find command holds all 1 + k documents, and its cursor id is 0.
 - `s5-types`: each result holds exactly one `order` and k `line` documents.
 - `s5-sorted`: each result starts with the `#ORDER` header, followed by
   `LINE#001` up to `LINE#k` in order. The sort order is checked, not assumed.
@@ -425,6 +433,7 @@ ASSERT:s5-teardown-clean:PASS
 
 Metrics:
 
-- `s5-requests` (requests needed to read one order);
+- `s5-requests` (requests needed to read one order: 1 for the find, plus one
+  per getMore; the largest over the 3 orders);
 - `s5-docs-returned-k25` (documents that one request returned for the 25-line
   order).
