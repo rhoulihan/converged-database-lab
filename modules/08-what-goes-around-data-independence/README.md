@@ -122,29 +122,34 @@ Metrics: `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`,
 S1 asked for one order. S1b asks the opposite kind of question: "which line
 items have sku X1?" The sku sits in exactly 20 lines spread over 20 orders.
 Orders have 10, 100 or 1,000 lines, each size on its own freshly built data, in
-the clustered layout. Cost is counted as in S1: logical reads on the second run,
-with the meter's overhead removed.
+the clustered layout. Cost is counted as in S1: logical reads only (buffer
+visits; not parse CPU or bytes sent to the client), on the second run, with the
+meter's overhead removed.
+
+Each side gets its best available plan. The cheaper of its two readers is the
+one that counts (`s1b-childtable-k<k>-reads`, `s1b-orderdocs-k<k>-reads`).
 
 | Reader | What it does |
 |---|---|
-| childtable | the line rows, through an index on `sku`. No join. |
+| childtable-plain | the line rows, through an index on `sku`. No join. |
+| childtable-covered | an index on `(sku, line_id, qty)` answers alone, with no row visits |
 | orderdocs-jsontable | order documents through a multivalue index on `items[*].sku`, then `JSON_TABLE` pulls out the matching item |
 | orderdocs-serialized | the matching whole orders through the same index, fetched serialized, as a client would before filtering |
 | itemdv | a duality view with one document per line, rooted on the line table, filtered on `sku` |
 
-The documents get their best plan, as the join did in S1: `s1b-orderdocs-k<k>-reads`
-is the cheaper of the two document readers.
+The serialized document reader is the cheaper document reader in logical
+reads, but it returns whole orders to find 20 pairs.
 
-**What the numbers show.** A document stored inside its row costs the same one
-block as a line row. So while orders fit in their rows (10 and 100 lines here),
-reading whole orders to find one item costs nothing extra. Once an order
-outgrows its row and is stored out of line (1,000 lines, about 50 KB), every
-match reads the whole order, and the documents do several times the work of
-the child table.
+**What the numbers show.** With a covering index, the decomposed form answers
+the child-centric query in a few reads, whatever the order size. The order
+documents pay about one block per matching order while each document fits in
+its row (10 and 100 lines here), and more once it is stored out of the row
+(1,000 lines, about 50 KB; `s1b-doc-bytes-k<k>` records the size). The item
+duality view reads the same covering index as the child table.
 
 **Knob 1: how often each query runs.** The script also measures S1's order read
 by key on the same data (`doc` and `join`). For 1,000 order reads plus q item
-queries:
+queries, where every order read hits a k-line order:
 
 ```
 documents : 1000*doc  + q*orderdocs
@@ -152,25 +157,26 @@ normalized: 1000*join + q*childtable
 crossover : q = 1000 * (join - doc) / (orderdocs - childtable)
 ```
 
-Below the crossover, documents do less total work; above it, normalized tables
-do. With in-row documents there is no crossover at all
-(`s1b-no-crossover-k10` and `-k100` are 1). Which way to go depends on how
-often the item query runs. In order processing, item queries are usually
-low-frequency reports and KPIs.
+Below the crossover, documents do fewer logical reads in total; above it,
+normalized tables do. Whether the item query's cost matters depends on how
+often it runs, and the crossover puts a number on that. It is approximate: a
+one-block change in any term moves it. In order processing, item queries are
+usually low-frequency reports and KPIs. If a crossover does not exist at some
+size, `s1b-no-crossover-k<k>` is 1.
 
 Expected assertions:
 
 ```
-ASSERT:s1b-inrow-no-penalty-k<k>:PASS            (k = 10, 100)
 ASSERT:s1b-outofrow-penalty-k1000:PASS
 ASSERT:s1b-itemdv-close-to-childtable-k<k>:PASS  (3)
 ASSERT:s1b-gap-grows-with-k:PASS
-ASSERT:s1b-crossover-k1000-positive:PASS
+ASSERT:s1b-penalty-ratio-grows:PASS
+ASSERT:s1b-crossover-k<k>-positive:PASS          (each k where documents cost more per item query)
 ASSERT:s1b-same-content:PASS
 ASSERT:s1b-plans-indexed:PASS
 ASSERT:s1b-teardown-clean:PASS
 ```
 
-Metrics: `s1b-{childtable|orderdocs|orderdocs-jsontable|orderdocs-serialized|itemdv|doc|join}-k{10|100|1000}-reads`,
-`s1b-crossover-item-queries-per-1000-order-reads-k1000`, `s1b-no-crossover-k{10|100}`,
-`s1b-meter-overhead-reads`.
+Metrics: `s1b-{childtable|childtable-plain|childtable-covered|orderdocs|orderdocs-jsontable|orderdocs-serialized|itemdv|doc|join}-k{10|100|1000}-reads`,
+`s1b-doc-bytes-k{k}`, `s1b-crossover-item-queries-per-1000-order-reads-k{k}` (or
+`s1b-no-crossover-k{k}`), `s1b-meter-overhead-reads`.

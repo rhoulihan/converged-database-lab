@@ -1,40 +1,41 @@
--- S1b, child-centric query: "the line items with sku X1", read three ways.
---   childtable: the line rows, found through an index on sku. No join.
---   orderdocs : order documents, found through a multivalue index on items[*].sku.
---               Two readers, and the cheaper one counts (the documents' best plan,
---               as the join got its best plan in S1):
---                 jsontable : JSON_TABLE pulls the matching item out of each order
---                 serialized: the matching whole orders are fetched serialized, as a
---                             client would before filtering
---   itemdv    : an item-centric duality view whose root is the line table,
---               filtered on sku.
--- All of them return the same content: line_id and qty for the 20 matching lines.
---
--- What to expect. A document stored inside its row costs the same one block as a
--- line row, so reading whole orders to find one item costs nothing extra while
--- the documents fit in their rows (k = 10 and 100 here). Once a document outgrows
--- its row and is stored out of line (k = 1000 here, about 50 KB), every match
--- reads the whole order, and the order documents overpay.
+-- S1b, child-centric query: "the line items with sku X1".
+-- Each side gets its best available plan, and the cheaper of its two readers counts.
+--   childtable (no join):
+--     plain    : the sku index, then each line row
+--     covered  : an index on (sku, line_id, qty) answers alone, with no row visits
+--   orderdocs (order documents, found through a multivalue index on items[*].sku):
+--     jsontable : JSON_TABLE pulls the matching item out of each order
+--     serialized: the matching whole orders are fetched serialized, as a client
+--                 would before filtering. Cheapest in reads, but it returns whole
+--                 orders to find 20 pairs.
+--   itemdv : an item-centric duality view rooted on the line table, filtered on sku.
+-- Every reader returns the same content: line_id and qty for the 20 matching lines.
 -- sku X1 sits in exactly 20 lines spread over 20 orders. The orders have k = 10,
 -- 100 or 1000 lines; each k gets its own freshly built data, so one measurement
 -- sees one k. Layout is clustered: each order's lines are inserted together.
 -- Each read runs twice; only the second run is measured (no parse cost).
--- Cost is 'session logical reads' (buffer visits), corrected for the meter's own
--- overhead.
+-- Cost is logical reads only (buffer visits; not parse CPU or bytes sent to the
+-- client), corrected for the meter's own overhead.
+--
+-- What to expect. With a covering index, the decomposed form answers the
+-- child-centric query in a few reads, whatever the order size. The order
+-- documents pay about one block per matching order while each document fits in
+-- its row (k = 10, 100), and more once it is stored out of the row (k = 1000,
+-- about 50 KB; s1b-doc-bytes-k<k> records the size).
 --
 -- Knob 1 (how often each query runs). The same data also serves the S1 read, one
 -- order by key, measured here at the same k:
 --   doc  : the order document by _id, serialized so its body is really read
 --   join : the order row joined to its line rows
--- For a workload of 1,000 order reads plus q item queries, the two designs cost
---   documents : 1000*doc  + q*orderdocs      (orderdocs = the cheaper reader)
+-- For a workload of 1,000 order reads plus q item queries, where every order read
+-- hits a k-line order, the two designs cost
+--   documents : 1000*doc  + q*orderdocs
 --   normalized: 1000*join + q*childtable
 -- They are equal at the crossover
 --   q = 1000 * (join - doc) / (orderdocs - childtable)
--- Above q item queries per 1,000 order reads, normalized tables do less work;
--- below it, documents do. Which way to go is knob 1: how often the item query runs.
--- With in-row documents (k = 10, 100) orderdocs - childtable <= 0: documents never
--- do more work, so there is no crossover (s1b-no-crossover-k<k> = 1).
+-- Below q item queries per 1,000 order reads, documents do fewer logical reads;
+-- above it, normalized tables do. The crossover is approximate: a one-block change
+-- in any term moves it.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08b_load;
@@ -50,7 +51,8 @@ delete from m08_metrics where name like 's1b-%' or name like 'tmp:s1b-%';
 -- m08b_build(k) drops and recreates them, so each k starts from empty tables.
 --   m08b_ord     : the order rows
 --   m08b_line    : the line rows, keyed by line_id; order_id is a plain NOT NULL
---                  foreign key; indexes on order_id and on sku
+--                  foreign key; indexes on order_id, on sku, and a covering
+--                  index on (sku, line_id, qty)
 --   m08b_ord_doc : the same orders as documents, with a multivalue index on
 --                  items[*].sku
 --   m08b_item_dv : one document per line, rooted on m08b_line (order_id not selected)
@@ -67,6 +69,7 @@ begin
                                sku varchar2(20), qty number)');
   ddl('create index m08b_line_order_ix on m08b_line (order_id)');
   ddl('create index m08b_line_sku_ix on m08b_line (sku)');
+  ddl('create index m08b_line_cov_ix on m08b_line (sku, line_id, qty)');
   ddl('create json collection table m08b_ord_doc');
   ddl('create multivalue index m08b_doc_sku_ix on m08b_ord_doc d (d.data.items[*].sku.string())');
   ddl('create json relational duality view m08b_item_dv as
@@ -137,7 +140,7 @@ end;
 /
 
 -- m08b_measure(k): run each reader twice, record the second run, then check that
--- the three item readers returned the same pairs and that every plan used an index.
+-- every item reader returned the same pairs and that every plan used an index.
 create or replace procedure m08b_measure(p_k number) as
   type t_key  is table of varchar2(36);
   type t_num  is table of number;
@@ -152,6 +155,7 @@ create or replace procedure m08b_measure(p_k number) as
   ser    t_skey;
   serq   t_sqty;
   ct_key t_key; ct_qty t_num;
+  cc_key t_key; cc_qty t_num;
   od_key t_key; od_qty t_num;
   dv_key t_key; dv_qty t_num;
   docs   t_blob;
@@ -162,10 +166,17 @@ create or replace procedure m08b_measure(p_k number) as
   ok     number;
   m      t_map;
 
-  -- child table: the line rows through the sku index. No join.
-  procedure childtable is
+  -- child table, plain: the sku index, then each line row. No join.
+  -- (The marker follows the real hint inside the hint comment, so PL/SQL keeps it.)
+  procedure childtable_plain is
   begin
-    select /*+ M08KIDCT */ l.line_id, l.qty bulk collect into ct_key, ct_qty
+    select /*+ index(l m08b_line_sku_ix) M08KIDCT */ l.line_id, l.qty bulk collect into ct_key, ct_qty
+      from m08b_line l where l.sku = 'X1';
+  end;
+  -- child table, covered: the (sku, line_id, qty) index answers alone; no row visits.
+  procedure childtable_covered is
+  begin
+    select /*+ index(l m08b_line_cov_ix) M08KIDCTC */ l.line_id, l.qty bulk collect into cc_key, cc_qty
       from m08b_line l where l.sku = 'X1';
   end;
   -- order documents: whole orders through the multivalue index, then the item.
@@ -223,7 +234,8 @@ create or replace procedure m08b_measure(p_k number) as
     for i in 1 .. 2 loop
       if i = 2 then m08_meter.snap; end if;
       case p_name
-        when 'childtable' then childtable;
+        when 'childtable-plain'     then childtable_plain;
+        when 'childtable-covered'   then childtable_covered;
         when 'orderdocs-jsontable'  then orderdocs;
         when 'orderdocs-serialized' then orderdocs_ser;
         when 'itemdv'     then itemdv;
@@ -236,7 +248,12 @@ create or replace procedure m08b_measure(p_k number) as
   end;
 begin
   select value into ovr from m08_metrics where name = 's1b-meter-overhead-reads';
-  measure('childtable');
+  measure('childtable-plain');
+  measure('childtable-covered');
+  -- The child table's best plan: the cheaper of the two readers.
+  m08_meter.record('s1b-childtable-k' || p_k || '-reads',
+                   least(r_of('s1b-childtable-plain-k' || p_k || '-reads'),
+                         r_of('s1b-childtable-covered-k' || p_k || '-reads')));
   measure('orderdocs-jsontable');
   measure('orderdocs-serialized');
   -- The documents' best plan: the cheaper of the two readers.
@@ -246,6 +263,8 @@ begin
   measure('itemdv');
   measure('doc');
   measure('join');
+  -- Stored size of one k-line order document (serialized JSON text, in bytes).
+  m08_meter.record('s1b-doc-bytes-k' || p_k, dbms_lob.getlength(docs(1)));
 
   -- Same content: the same 20 (line_id, qty) pairs from every item reader. The
   -- serialized orders are filtered here, as the client would.
@@ -262,13 +281,15 @@ begin
       end loop;
     end loop;
   end if;
-  if ct_key.count <> 20 or od_key.count <> 20 or dv_key.count <> 20 or ser.count <> 20 then
+  if ct_key.count <> 20 or cc_key.count <> 20 or od_key.count <> 20
+     or dv_key.count <> 20 or ser.count <> 20 then
     same := 0;
   else
     for i in 1 .. ct_key.count loop m(ct_key(i)) := ct_qty(i); end loop;
     if m.count <> 20 then same := 0; end if;
     for i in 1 .. 20 loop
-      if not m.exists(od_key(i)) or m(od_key(i)) <> od_qty(i)
+      if not m.exists(cc_key(i)) or m(cc_key(i)) <> cc_qty(i)
+         or not m.exists(od_key(i)) or m(od_key(i)) <> od_qty(i)
          or not m.exists(dv_key(i)) or m(dv_key(i)) <> dv_qty(i)
          or not m.exists(ser(i)) or m(ser(i)) <> serq(i) then
         same := 0;
@@ -277,22 +298,29 @@ begin
   end if;
   m08_meter.record('tmp:s1b-same-content-k' || p_k, same);
 
-  -- Plans: every marker has a valid cursor with an INDEX step and no full table scan.
+  -- Plans: every marker has a valid cursor with an INDEX step and no full table
+  -- scan, and the covered child-table reader visits no table at all. Markers sit
+  -- last in their hint comment, so they are matched as ' <marker> */'.
   select case when (select count(distinct mk.marker)
-                      from (select 'M08KIDCT' marker from dual union all select 'M08KIDOD' from dual
-                            union all select 'M08KIDODS' from dual
+                      from (select 'M08KIDCT' marker from dual union all select 'M08KIDCTC' from dual
+                            union all select 'M08KIDOD' from dual union all select 'M08KIDODS' from dual
                             union all select 'M08KIDDV' from dual union all select 'M08KIDDOC' from dual
                             union all select 'M08KIDJOIN' from dual) mk
                      where exists (select 1 from v$sql s join v$sql_plan p
                                        on p.sql_id = s.sql_id and p.child_number = s.child_number
-                                    where upper(s.sql_text) like '%/*+ ' || mk.marker || ' */%'
+                                    where upper(s.sql_text) like '% ' || mk.marker || ' */%'
                                       and s.object_status = 'VALID'
-                                      and p.operation = 'INDEX')) = 6
+                                      and p.operation = 'INDEX')) = 7
                and (select count(*) from v$sql s join v$sql_plan p
                         on p.sql_id = s.sql_id and p.child_number = s.child_number
-                     where upper(s.sql_text) like '%/*+ M08' || 'KID%'
+                     where upper(s.sql_text) like '%M08' || 'KID%'
                        and s.object_status = 'VALID'
                        and p.operation = 'TABLE ACCESS' and p.options like '%FULL%') = 0
+               and (select count(*) from v$sql s join v$sql_plan p
+                        on p.sql_id = s.sql_id and p.child_number = s.child_number
+                     where upper(s.sql_text) like '% M08' || 'KIDCTC */%'
+                       and s.object_status = 'VALID'
+                       and p.operation = 'TABLE ACCESS') = 0
               then 1 else 0 end
     into ok from dual;
   m08_meter.record('tmp:s1b-plans-indexed-k' || p_k, ok);
@@ -330,10 +358,10 @@ begin
 end;
 /
 
--- Crossover (knob 1), k = 1000 only: q = 1000 * (join - doc) / (orderdocs - childtable),
--- rounded; it is left out unless both terms are positive (s1b-crossover-k1000-positive
--- then fails). For in-row documents (k = 10, 100) record s1b-no-crossover-k<k>: 1 when
--- orderdocs <= childtable (documents never do more work), else 0.
+-- Crossover (knob 1), at every k:
+--   q = 1000 * (join - doc) / (orderdocs - childtable), rounded,
+-- with orderdocs and childtable each the cheaper of its two readers. It exists only
+-- when both terms are positive; otherwise s1b-no-crossover-k<k> = 1 is recorded.
 declare
   function v(p_name varchar2) return number is
     x number;
@@ -342,19 +370,18 @@ declare
     return x;
   end;
 begin
-  for k in (select column_value k from table(sys.odcinumberlist(10, 100))) loop
-    m08_meter.record('s1b-no-crossover-k' || k.k,
-                     case when v('s1b-orderdocs-k' || k.k || '-reads') <=
-                               v('s1b-childtable-k' || k.k || '-reads') then 1 else 0 end);
+  for k in (select column_value k from table(sys.odcinumberlist(10, 100, 1000))) loop
+    declare
+      num number := 1000 * (v('s1b-join-k' || k.k || '-reads') - v('s1b-doc-k' || k.k || '-reads'));
+      den number := v('s1b-orderdocs-k' || k.k || '-reads') - v('s1b-childtable-k' || k.k || '-reads');
+    begin
+      if num > 0 and den > 0 then
+        m08_meter.record('s1b-crossover-item-queries-per-1000-order-reads-k' || k.k, round(num / den));
+      else
+        m08_meter.record('s1b-no-crossover-k' || k.k, 1);
+      end if;
+    end;
   end loop;
-  declare
-    num number := 1000 * (v('s1b-join-k1000-reads') - v('s1b-doc-k1000-reads'));
-    den number := v('s1b-orderdocs-k1000-reads') - v('s1b-childtable-k1000-reads');
-  begin
-    if num > 0 and den > 0 then
-      m08_meter.record('s1b-crossover-item-queries-per-1000-order-reads-k1000', round(num / den));
-    end if;
-  end;
 end;
 /
 
@@ -365,16 +392,6 @@ select 'METRIC:' || name || ':' || to_char(value, 'FM999999990')
  order by name;
 
 -- ===== Assertions (read back from m08_metrics) =====
-
--- In-row documents: reading the whole order costs no more than reading the line
--- row (2 reads of slack for block placement).
-with ks as (select column_value k from table(sys.odcinumberlist(10, 100)))
-select 'ASSERT:s1b-inrow-no-penalty-k' || k || ':' ||
-       case when (select value from m08_metrics where name = 's1b-orderdocs-k' || k || '-reads') <=
-                 (select value from m08_metrics where name = 's1b-childtable-k' || k || '-reads') + 2
-            then 'PASS' else 'FAIL' end
-  from ks
- order by k;
 
 -- Out-of-row documents: every match reads a whole order, more than twice the child table.
 select 'ASSERT:s1b-outofrow-penalty-k1000:' ||
@@ -401,12 +418,26 @@ select 'ASSERT:s1b-gap-grows-with-k:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- At k = 1000 there is a finite crossover above zero.
-select 'ASSERT:s1b-crossover-k1000-positive:' ||
-       case when (select value from m08_metrics
-                   where name = 's1b-crossover-item-queries-per-1000-order-reads-k1000') > 0
+-- The penalty per item query grows once documents leave the row.
+select 'ASSERT:s1b-penalty-ratio-grows:' ||
+       case when (select value from m08_metrics where name = 's1b-orderdocs-k1000-reads') /
+                 nullif((select value from m08_metrics where name = 's1b-childtable-k1000-reads'), 0) >
+                 (select value from m08_metrics where name = 's1b-orderdocs-k100-reads') /
+                 nullif((select value from m08_metrics where name = 's1b-childtable-k100-reads'), 0)
             then 'PASS' else 'FAIL' end
   from dual;
+
+-- Wherever the order documents cost more per item query, there is a finite
+-- crossover above zero.
+with ks as (select column_value k from table(sys.odcinumberlist(10, 100, 1000)))
+select 'ASSERT:s1b-crossover-k' || k || '-positive:' ||
+       case when (select value from m08_metrics
+                   where name = 's1b-crossover-item-queries-per-1000-order-reads-k' || k) > 0
+            then 'PASS' else 'FAIL' end
+  from ks
+ where (select value from m08_metrics where name = 's1b-orderdocs-k' || k || '-reads') >
+       (select value from m08_metrics where name = 's1b-childtable-k' || k || '-reads')
+ order by k;
 
 -- Every item reader returned the same 20 (line_id, qty) pairs at every k.
 select 'ASSERT:s1b-same-content:' ||
