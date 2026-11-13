@@ -10,6 +10,75 @@ container and emits machine-checkable rows:
 
 ---
 
+## What this module is for
+
+Article 08 makes one argument: Codd's data independence, the rule that an
+application should not break when the storage under it changes, can be restored
+for documents. A JSON Relational Duality View puts a declarative view between
+the document the app reads and writes and the tables that store it, so the
+storage can change while the app stays the same.
+
+The article is also a reply to Stonebraker and Pavlo, "What Goes Around Comes
+Around... And Around...", SIGMOD Record 53(2), 2024. They make several claims
+about document and key-value databases. Each scenario below answers one of
+those claims with something you can run, including the cases where documents
+lose. All of it runs on Oracle AI Database 26ai Free in the lab container.
+
+## Scenario index
+
+Quotes are from Stonebraker and Pavlo 2024, section 2.
+
+| Scenario | Script(s) | The claim it answers | What it proves |
+|---|---|---|---|
+| S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. |
+| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does no more logical reads than the best indexed join, in both a clustered and an interleaved layout. The join's cost grows with the number of lines. The duality view is a join and costs at least as much as the document. |
+| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work. |
+| S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
+| S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
+| S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines, sorted, through an index range scan. No app-side join, no multi-get. |
+| teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
+
+## How to run
+
+From the repo root:
+
+```bash
+docker compose up -d                  # wait until lab-oracle is healthy
+pip install -r validator/requirements.txt
+python3 validator/run.py
+```
+
+The validator runs every module in order, then every script in this module in
+file-name order. The scripts depend on that order: `00` builds the meter that
+later scripts use, and the S3 stages build on each other. A full run of this
+module takes about a minute, much of it the API restart in `02b`.
+
+Numbers for the article come only from `validator/results.json`, under
+`"metrics"`.
+
+## The commit exception
+
+The lab contract is that scripts leave the shared domain unchanged: the
+validator rolls back after each SQL script. This module bends that rule, and
+cleans up after itself.
+
+- **The S3 stage scripts commit on purpose.** `02`, `04` and `06` each move the
+  storage one step and `COMMIT`, because the next stage has to see the change.
+  The rollback after each script would otherwise undo the move.
+- **The S1, S1b and S2 scripts commit their test data.** They build their own
+  `M08`-prefixed tables (DDL commits anyway) and commit the seeded rows so the
+  measured statements read committed data.
+- **The cutover script recycles the API tier.** `02b-cutover-recycle-api.sh`
+  restarts the lab container so the MongoDB API re-reads the collection
+  details. The validator opens a new SQL connection after any `.sh` script.
+
+None of this touches the shared `ORDERS`, `ORDER_ITEMS` or `order_dv`. Every
+scenario drops its own objects and checks that it is clean,
+`08-teardown-s3.sql` removes all S3 objects, and `99-teardown.sql` checks the
+whole module. The validator can run back to back with no leftovers.
+
+---
+
 ## Harness: `scripts/00-meter.sql`
 
 Creates the `m08_meter` package and the `m08_metrics` session table that the
@@ -437,3 +506,18 @@ Metrics:
   per getMore; the largest over the 3 orders);
 - `s5-docs-returned-k25` (documents that one request returned for the 25-line
   order).
+
+## Teardown: `scripts/99-teardown.sql`
+
+Empties and drops the meter's session table `m08_metrics`, drops the
+`m08_meter` package, and then checks that nothing from this module is left in
+the schema. The check lists every name the module uses, matched without regard
+to case: the prefixes `M08_`, `M08B_`, `M08S2_`, `M08S4_` and `M08S5_` (which
+covers the `m08s5_single` collection), and the S3 names `sales_orders`,
+`SALES_ORDERS_T`, `SALES_ORDER_LINES`, `SALES_ORDERS_V0` and `probe_runs`.
+
+Expected assertions:
+
+```
+ASSERT:s08-module-clean:PASS
+```

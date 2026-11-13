@@ -109,6 +109,7 @@ What is on **this repo's `main`** right now:
 | 01 | `what-is-a-converged-database` | On main | 5 | 20 | [README](modules/01-what-is-a-converged-database/README.md) · [published article](https://blogs.oracle.com/developers/what-is-a-converged-database-definition-five-tests-and-ai-use-cases) |
 | 03 | `vector-vs-converged` | On main (10K corpus, IVF filter-first proof, HVI) | 4 | 23 | [README](modules/03-vector-vs-converged/README.md) · article in draft |
 | 02, 04–06 | see per-article `article/NN-*` branches | dev branches here; modules 01–03 are live on the [hub's main](https://github.com/oracle-devrel/oracle-umt-developer-hub/tree/main/labs/converged-database-lab) | — | — | — |
+| 08 | `what-goes-around-data-independence` | This branch (`article/08-what-goes-around-data-independence`) | 6 | 72 | [README](modules/08-what-goes-around-data-independence/README.md) · article in draft |
 
 ---
 
