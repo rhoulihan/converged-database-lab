@@ -116,3 +116,61 @@ ASSERT:s1-teardown-clean:PASS
 
 Metrics: `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`,
 `s1-n1-k{k}-execs`, `s1-meter-overhead-reads`, `s1-meter-overhead-execs`.
+
+### S1b: find the line items with one sku (`scripts/20-s1b-child-centric.sql`)
+
+S1 asked for one order. S1b asks the opposite kind of question: "which line
+items have sku X1?" The sku sits in exactly 20 lines spread over 20 orders.
+Orders have 10, 100 or 1,000 lines, each size on its own freshly built data, in
+the clustered layout. Cost is counted as in S1: logical reads on the second run,
+with the meter's overhead removed.
+
+| Reader | What it does |
+|---|---|
+| childtable | the line rows, through an index on `sku`. No join. |
+| orderdocs-jsontable | order documents through a multivalue index on `items[*].sku`, then `JSON_TABLE` pulls out the matching item |
+| orderdocs-serialized | the matching whole orders through the same index, fetched serialized, as a client would before filtering |
+| itemdv | a duality view with one document per line, rooted on the line table, filtered on `sku` |
+
+The documents get their best plan, as the join did in S1: `s1b-orderdocs-k<k>-reads`
+is the cheaper of the two document readers.
+
+**What the numbers show.** A document stored inside its row costs the same one
+block as a line row. So while orders fit in their rows (10 and 100 lines here),
+reading whole orders to find one item costs nothing extra. Once an order
+outgrows its row and is stored out of line (1,000 lines, about 50 KB), every
+match reads the whole order, and the documents do several times the work of
+the child table.
+
+**Knob 1: how often each query runs.** The script also measures S1's order read
+by key on the same data (`doc` and `join`). For 1,000 order reads plus q item
+queries:
+
+```
+documents : 1000*doc  + q*orderdocs
+normalized: 1000*join + q*childtable
+crossover : q = 1000 * (join - doc) / (orderdocs - childtable)
+```
+
+Below the crossover, documents do less total work; above it, normalized tables
+do. With in-row documents there is no crossover at all
+(`s1b-no-crossover-k10` and `-k100` are 1). Which way to go depends on how
+often the item query runs. In order processing, item queries are usually
+low-frequency reports and KPIs.
+
+Expected assertions:
+
+```
+ASSERT:s1b-inrow-no-penalty-k<k>:PASS            (k = 10, 100)
+ASSERT:s1b-outofrow-penalty-k1000:PASS
+ASSERT:s1b-itemdv-close-to-childtable-k<k>:PASS  (3)
+ASSERT:s1b-gap-grows-with-k:PASS
+ASSERT:s1b-crossover-k1000-positive:PASS
+ASSERT:s1b-same-content:PASS
+ASSERT:s1b-plans-indexed:PASS
+ASSERT:s1b-teardown-clean:PASS
+```
+
+Metrics: `s1b-{childtable|orderdocs|orderdocs-jsontable|orderdocs-serialized|itemdv|doc|join}-k{10|100|1000}-reads`,
+`s1b-crossover-item-queries-per-1000-order-reads-k1000`, `s1b-no-crossover-k{10|100}`,
+`s1b-meter-overhead-reads`.
