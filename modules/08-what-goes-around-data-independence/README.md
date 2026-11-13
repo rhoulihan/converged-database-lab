@@ -32,6 +32,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
 | S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does no more logical reads than the best indexed join, in both a clustered and an interleaved layout. The join's cost grows with the number of lines. The duality view is a join and costs at least as much as the document. |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, against the strongest join | S1's join used a heap table with a single-column index. This reruns the interleaved case against a covering index, an index-organized table (IOT), an index cluster and a duality view over the IOT, and reports the reads with no direction asserted between the document and any join. |
 | S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, when such a crossover exists. |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
@@ -65,7 +66,7 @@ cleans up after itself.
 - **The S3 stage scripts commit on purpose.** `02`, `04` and `06` each move the
   storage one step and `COMMIT`, because the next stage has to see the change.
   The rollback after each script would otherwise undo the move.
-- **The S1, S1b and S2 scripts commit their test data.** They build their own
+- **The S1, S1 (A), S1b and S2 scripts commit their test data.** They build their own
   `M08`-prefixed tables (DDL commits anyway) and commit the seeded rows so the
   measured statements read committed data.
 - **The cutover script recycles the API tier.** `02b-cutover-recycle-api.sh`
@@ -130,7 +131,12 @@ ASSERT:m08-meter-ready:PASS
 ASSERT:m08-meter-cpu-ready:PASS
 ASSERT:m08-meter-repeat-ready:PASS
 ASSERT:m08-meter-lob-guard:PASS
+ASSERT:m08-meter-json-always-rejected:PASS
+ASSERT:m08-meter-lob-guard-null-safe:PASS
 ```
+
+The last two check the guard's edges: a bare JSON column is refused even with
+`p_allow_lob => TRUE`, and `p_allow_lob => NULL` counts as `FALSE`.
 
 ## Proofs
 
@@ -222,6 +228,84 @@ ASSERT:s1-teardown-clean:PASS
 
 Metrics: `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`,
 `s1-n1-k{k}-execs`, `s1-meter-overhead-reads`, `s1-meter-overhead-execs`.
+
+Before its teardown, S1 copies its interleaved `doc` and `join` reads to
+`ref:s1-*` rows in the session table, so `12-s1-physical-join.sql` can check
+that its heap baseline reproduces them. That script removes the rows.
+
+### S1 physical variants (A) (`scripts/12-s1-physical-join.sql`)
+
+A fair objection to S1: its join reads a heap table through a single-column
+`order_id` index, so in the interleaved layout every line is its own block.
+Oracle has physical designs that keep an order's lines together whatever order
+they arrive in. This script measures them. It builds its own data (prefix
+`M08A_`) with S1's interleaved recipe and loads every line table in that same
+interleaved order, so any clustering comes from the physical design, not from
+the load order.
+
+| Reader | Storage | How the lines are found |
+|---|---|---|
+| doc | JSON collection table | one document by its `_id` index, serialized so the body is read |
+| heap | heap table, index on `order_id` | S1's interleaved join: one table block per line |
+| cov | heap table, covering index `(order_id, line_id, sku, qty)` | an index range scan; the table is never visited |
+| iot | index-organized table, primary key `(order_id, line_id)` | an index range scan; the rows live in the index, sorted by order |
+| clu | index cluster on `order_id` holding the order and line tables | one cluster index lookup, then the order's cluster blocks |
+| dv | duality view over the iot tables | the iot join, built into a document (a join, measured as one) |
+
+The cluster is sized `SIZE 512`: a typical 10-line order is about 10 line rows
+of roughly 40 bytes plus its header row, so about 500 bytes per key and about
+15 orders per 8 KB block. The 1,000-line order chains extra blocks onto its key.
+
+Statistics are gathered without histograms (`SIZE 1`). With the default
+(`SIZE AUTO`), a histogram on `order_id` appears or not depending on when the
+database last flushed its column-usage data, and when it appears the optimizer
+reads the heap table's 1,000-line order with a full table scan (about 1,000
+reads instead of about 900). Without histograms every reader gets the same
+indexed plan on every run, and the plan checks below hold it there.
+
+Every reader returns the same content: the order and all of its lines. Reads
+are counted on the second run with the meter overhead removed, as in S1. CPU
+and elapsed time come from `m08_meter.measure_repeat` (20 runs) for k = 100
+and k = 1,000 only, since smaller reads are below its one-centisecond
+resolution. On the lab container they are also below it at k = 1,000: the
+medians are 0 cs for every reader, so time does not separate them here.
+
+**What it shows.** The physical designs close most of the gap, and that is the
+honest headline. At 1,000 lines the IOT, the cluster and the duality view over
+the IOT need about a dozen logical reads where the heap join needs about 900.
+The covering index is close behind. On the lab container none of them did
+fewer reads than the document at any k, so the document is still the cheapest
+read, but only by a few reads, not by the large factor the heap baseline
+shows. To get that close, the join needs a physical design picked for this one
+access pattern (lines stored by order), which is the same choice the document
+makes. The script asserts no direction between the document and any join; the
+numbers are in `validator/results.json`.
+
+Expected assertions:
+
+```
+ASSERT:s1a-same-content-k<k>:PASS            (4)
+ASSERT:s1a-dv-same-document:PASS
+ASSERT:s1a-plan-clu:PASS                     TABLE ACCESS CLUSTER on the line table
+ASSERT:s1a-plan-cov:PASS                     covering index range scan, no TABLE ACCESS on the line table
+ASSERT:s1a-plan-dv:PASS                      INDEX RANGE SCAN on the IOT primary key
+ASSERT:s1a-plan-iot:PASS                     INDEX RANGE SCAN on the IOT primary key
+ASSERT:s1a-plans-indexed:PASS
+ASSERT:s1a-heap-matches-s1-k<k>:PASS         (4) heap within 5 reads of S1's join, doc within 2 of S1's doc
+ASSERT:s1a-clu-colocated:PASS
+ASSERT:s1a-teardown-clean:PASS
+```
+
+`s1a-heap-matches-s1-k<k>` needs S1's `ref:s1-*` rows, so it fails if this
+script runs without `10-s1-read-by-key.sql` before it in the same session.
+
+Metrics:
+
+- `s1a-{doc|heap|cov|iot|clu|dv}-k{1|10|100|1000}-reads` (second-run reads);
+- `s1a-{reader}-k{100|1000}-{reads-median|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max|overhead-reads}`
+  (from `measure_repeat`);
+- `s1a-{heap|clu}-k{k}-blocks` (distinct blocks holding the target's lines);
+- `s1a-meter-overhead-reads`.
 
 ### S1b: find the line items with one sku (`scripts/20-s1b-child-centric.sql`)
 
@@ -549,7 +633,7 @@ Metrics:
 Empties and drops the meter's session table `m08_metrics`, drops the
 `m08_meter` package, and then checks that nothing from this module is left in
 the schema. The check lists every name the module uses, matched without regard
-to case: the prefixes `M08_`, `M08B_`, `M08S2_`, `M08S4_` and `M08S5_` (which
+to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08S2_`, `M08S4_` and `M08S5_` (which
 covers the `m08s5_single` collection), and the S3 names `sales_orders`,
 `SALES_ORDERS_T`, `SALES_ORDER_LINES`, `SALES_ORDERS_V0` and `probe_runs`.
 

@@ -18,7 +18,7 @@ drop view if exists m08_ord_dv;
 drop table if exists m08_line purge;
 drop table if exists m08_ord purge;
 drop table if exists m08_ord_doc purge;
-delete from m08_metrics where name like 's1-%' or name like 'tmp:s1-%';
+delete from m08_metrics where name like 's1-%' or name like 'tmp:s1-%' or name like 'ref:s1-%';
 
 -- ===== Projections =====
 
@@ -399,6 +399,13 @@ select 'ASSERT:s1-plans-indexed:' ||
   from dual;
 
 -- ===== Teardown =====
+-- Hand the interleaved document and join reads to 12-s1-physical-join.sql,
+-- which checks that its heap baseline reproduces them. These 'ref:' rows stay
+-- in the session table until that script (or 99-teardown.sql) removes them.
+insert into m08_metrics (name, value)
+  select 'ref:' || name, value from m08_metrics
+   where name like 's1-join-interleaved-k%-reads' or name like 's1-doc-interleaved-k%-reads';
+
 -- Clear this script's rows first: the DDL below commits, so the validator's
 -- rollback would not remove them. The meter package and m08_metrics stay.
 delete from m08_metrics where name like 's1-%' or name like 'tmp:s1-%';

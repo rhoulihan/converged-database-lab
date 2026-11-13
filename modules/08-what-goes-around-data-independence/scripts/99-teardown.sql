@@ -25,6 +25,7 @@ drop table if exists m08_metrics purge;
 select 'ASSERT:s08-module-clean:' ||
        case when (select count(*) from user_objects
                    where upper(object_name) like 'M08\_%'   escape '\'
+                      or upper(object_name) like 'M08A\_%'  escape '\'
                       or upper(object_name) like 'M08B\_%'  escape '\'
                       or upper(object_name) like 'M08S2\_%' escape '\'
                       or upper(object_name) like 'M08S4\_%' escape '\'

@@ -150,7 +150,7 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
           RAISE_APPLICATION_ERROR(-20802, 'm08_meter.measure_repeat: column ' || i
             || ' is JSON and would be fetched as a locator (reads under-counted);'
             || ' select json_serialize(<col> returning blob) with p_allow_lob => TRUE');
-        WHEN d(i).col_type IN (112, 113) AND NOT p_allow_lob THEN
+        WHEN d(i).col_type IN (112, 113) AND NOT NVL(p_allow_lob, FALSE) THEN
           RAISE_APPLICATION_ERROR(-20802, 'm08_meter.measure_repeat: column ' || i
             || ' is a LOB and would be fetched as a locator (reads under-counted);'
             || ' read its bytes with dbms_lob, or pass p_allow_lob => TRUE for a'
@@ -351,6 +351,45 @@ END;
 
 SELECT 'ASSERT:m08-meter-lob-guard:' ||
        CASE WHEN (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-json-guard') = 1
+            THEN 'PASS' ELSE 'FAIL' END
+  FROM dual;
+
+-- A bare JSON column is refused even when the caller opts in to LOBs: the
+-- opt-in covers serialized values only, never a locator-fetched document.
+BEGIN
+  BEGIN
+    m08_meter.measure_repeat('m08-meter-selftest-json2', 'select j from m08_meter_selftest', 1,
+                             p_allow_lob => TRUE);
+    m08_meter.record('m08-meter-selftest-json-optin-guard', 0);
+  EXCEPTION
+    WHEN OTHERS THEN
+      m08_meter.record('m08-meter-selftest-json-optin-guard', CASE WHEN SQLCODE = -20802 THEN 1 ELSE 0 END);
+  END;
+END;
+/
+
+SELECT 'ASSERT:m08-meter-json-always-rejected:' ||
+       CASE WHEN (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-json-optin-guard') = 1
+            THEN 'PASS' ELSE 'FAIL' END
+  FROM dual;
+
+-- The LOB guard is NULL-safe: p_allow_lob => NULL counts as FALSE, so a LOB
+-- column is still refused.
+BEGIN
+  BEGIN
+    m08_meter.measure_repeat('m08-meter-selftest-lobnull',
+                             'select json_serialize(j returning blob) from m08_meter_selftest', 1,
+                             p_allow_lob => NULL);
+    m08_meter.record('m08-meter-selftest-lob-null-guard', 0);
+  EXCEPTION
+    WHEN OTHERS THEN
+      m08_meter.record('m08-meter-selftest-lob-null-guard', CASE WHEN SQLCODE = -20802 THEN 1 ELSE 0 END);
+  END;
+END;
+/
+
+SELECT 'ASSERT:m08-meter-lob-guard-null-safe:' ||
+       CASE WHEN (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-lob-null-guard') = 1
             THEN 'PASS' ELSE 'FAIL' END
   FROM dual;
 
