@@ -362,3 +362,69 @@ Metrics:
 - `s4-docs-updated`;
 - `s4-order-docs-showing-new-name`;
 - `s4-name-copies`.
+
+### S5: one request for a parent and all its children (`scripts/50-s5-single-collection.js`)
+
+Stonebraker and Pavlo say about key-value stores (section 2.2): "If an
+application requires multiple fields in a record, then KV stores are probably a
+bad idea", and that "developers must implement joins or multi-get operations in
+their application". S5 shows the single-collection design answering that
+through the MongoDB API. It is a correctness check, not a measurement.
+
+The pattern is vendor-neutral document modeling theory. It works in any store
+that can read a range of items by a partition key and a sort key.
+
+Every document in the collection `m08s5_single` carries two keys:
+
+| Field | Order header | Line item |
+|---|---|---|
+| `_id` | `ORD#7` | `ORD#7#LINE#001` |
+| `pk` (partition key) | `ORD#7` | `ORD#7` |
+| `sk` (sort key) | `#ORDER` | `LINE#001` |
+| `type` | `order` | `line` |
+
+The header and its lines share one partition key, so together they form one
+item collection. The sort key puts the header first, because `#` sorts before
+`L`, and line numbers are zero-padded so `LINE#010` sorts after `LINE#009`. An
+index on `{pk: 1, sk: 1}` finds the item collection.
+
+The script seeds 3 orders with 5, 10 and 25 lines, inserted out of order and
+interleaved across orders. It then reads each order with one request:
+`find({pk: "ORD#7"}).sort({sk: 1})`.
+
+**What it proves.**
+
+- **One request, the whole order.** Each find returns the header and every
+  line, already in order. The app does no join and no multi-get.
+- **The database does the work.** The plan reads the `{pk, sk}` index by range
+  scan; nothing scans the whole table. The API sorts the result on `sk`, so the
+  order does not depend on how the documents were written.
+- **Items stay separate.** Each line is its own document, so it can be
+  inserted, changed or deleted on its own, without rewriting the order.
+
+Expected assertions:
+
+```
+ASSERT:s5-one-find-returns-all:PASS
+ASSERT:s5-types:PASS
+ASSERT:s5-sorted:PASS
+ASSERT:s5-index-used:PASS
+ASSERT:s5-no-cross-talk:PASS
+ASSERT:s5-teardown-clean:PASS
+```
+
+- `s5-one-find-returns-all`: for each of the 3 orders, one request returns
+  1 + k documents.
+- `s5-types`: each result holds exactly one `order` and k `line` documents.
+- `s5-sorted`: each result starts with the `#ORDER` header, followed by
+  `LINE#001` up to `LINE#k` in order. The sort order is checked, not assumed.
+- `s5-index-used`: `explain()` shows an index range scan on `pk_1_sk_1` and no
+  full scan.
+- `s5-no-cross-talk`: a find for one order returns no documents from another.
+- `s5-teardown-clean`: the collection is gone at the end.
+
+Metrics:
+
+- `s5-requests` (requests needed to read one order);
+- `s5-docs-returned-k25` (documents that one request returned for the 25-line
+  order).
