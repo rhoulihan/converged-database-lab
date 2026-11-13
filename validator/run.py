@@ -11,8 +11,9 @@ Contract: scripts live in modules/NN-slug/scripts/, run in lexical order.
             'ASSERT:<name>:PASS|FAIL' are assertions; 'METRIC:<name>:<value>' are
             measurements.
 Exit code 0 iff every assertion in every module is PASS and no script errors.
-Metrics never affect the exit code. Writes validator/results.json, including
-"metrics": {module: {name: value}}.
+A METRIC line that does not parse, or a METRIC name repeated within a module,
+is a script error; otherwise metrics never affect the exit code.
+Writes validator/results.json, including "metrics": {module: {name: value}}.
 """
 import json, os, re, subprocess, sys, time
 import oracledb
@@ -46,15 +47,42 @@ def parse_cell(cell):
         return ("assert", m.group(1), m.group(2))
     return ("metric", m.group(3), m.group(4))
 
-def _collect(cell, asserts, metrics):
+def scan_metric(line, metrics, errors):
+    """Record a METRIC line into metrics; anything else is ignored.
+
+    results.json is the article's only source of numbers, so a line that starts
+    with 'METRIC:' but does not parse, or that repeats a name, is an error.
+    """
+    if not line.strip().startswith("METRIC:"):
+        return
+    parsed = parse_cell(line)
+    if parsed is None or parsed[0] != "metric":
+        errors.append(f"malformed metric: {line.strip()!r}")
+        return
+    _, name, value = parsed
+    if name in metrics:
+        errors.append(f"duplicate metric {name!r}: {metrics[name]} then {value}")
+        return
+    metrics[name] = value
+
+def merge_metrics(module_metrics, script_metrics, script):
+    """Merge one script's metrics into its module's; return duplicate-name errors."""
+    errors = []
+    for name, value in script_metrics.items():
+        if name in module_metrics:
+            errors.append(f"{script}: duplicate metric {name!r} in module "
+                          f"(already {module_metrics[name]}, now {value})")
+        else:
+            module_metrics[name] = value
+    return errors
+
+def _collect(cell, asserts, metrics, errors):
     # ASSERT cells are kept verbatim, exactly as before parse_cell existed, so a
     # malformed ASSERT still surfaces in results.json instead of vanishing.
     if cell.startswith("ASSERT:"):
         asserts.append(cell)
         return
-    parsed = parse_cell(cell)
-    if parsed and parsed[0] == "metric":
-        metrics[parsed[1]] = parsed[2]
+    scan_metric(cell, metrics, errors)
 
 def split_sql(text):
     """Yield executable statements. PL/SQL blocks end with a line '/'; plain SQL ends ';'.
@@ -92,15 +120,17 @@ def run_sql(path, conn):
     with open(path, encoding="utf-8") as fh:
         text = fh.read()
     cur = conn.cursor()
+    row_errors = []
     for stmt in split_sql(text):
         try:
             cur.execute(stmt)
             if stmt.lstrip().upper().startswith(("SELECT", "WITH")):
                 for row in cur.fetchall():
-                    _collect(str(row[0]) if row else "", asserts, metrics)
+                    _collect(str(row[0]) if row else "", asserts, metrics, row_errors)
         except Exception as e:
             errors.append(f"{os.path.basename(path)}: {e}\n  stmt: {stmt[:200]}")
     conn.rollback()  # demos must leave the domain unchanged
+    errors += [f"{os.path.basename(path)}: {e}" for e in row_errors]
     return asserts, errors, metrics
 
 def run_js(path):
@@ -111,16 +141,16 @@ def run_js(path):
            "--file", "/dev/stdin"]
     with open(path, "rb") as fh:
         proc = subprocess.run(cmd, stdin=fh, capture_output=True, text=True, timeout=300)
-    out = proc.stdout + proc.stderr
+    # Newline-joined so a final stdout line without '\n' cannot fuse with stderr.
+    out = proc.stdout + "\n" + proc.stderr
     # Keep the historical substring match for ASSERT (a line may carry a
     # prefix); METRIC lines are taken whole-line via parse_cell.
     asserts = re.findall(r"ASSERT:[\w-]+:(?:PASS|FAIL)", out)
-    metrics = {}
+    metrics, metric_errors = {}, []
     for line in out.splitlines():
-        parsed = parse_cell(line)
-        if parsed and parsed[0] == "metric":
-            metrics[parsed[1]] = parsed[2]
+        scan_metric(line, metrics, metric_errors)
     errors = [] if proc.returncode == 0 else [f"{os.path.basename(path)}: mongosh rc={proc.returncode}\n{out[-800:]}"]
+    errors += [f"{os.path.basename(path)}: {e}" for e in metric_errors]
     return asserts, errors, metrics
 
 def main():
@@ -140,20 +170,20 @@ def main():
                 asserts, errors, metrics = run_js(path)
             else:
                 continue
+            errors += merge_metrics(all_metrics.setdefault(mod, {}), metrics, script)
             fails = [a for a in asserts if a.endswith(":FAIL")]
             status = "PASS" if not fails and not errors else "FAIL"
             ok = ok and status == "PASS"
             results.append({"module": mod, "script": script, "status": status,
                             "assertions": asserts, "errors": errors})
-            if metrics:
-                all_metrics.setdefault(mod, {}).update(metrics)
             print(f"[{status}] {mod}/{script}  ({len(asserts)} assertions)")
             for e in errors:
                 print(f"    ERROR {e}")
     conn.close()
     summary = {"validated_against": "Oracle AI Database 26ai Free (gvenzl 23.26.x image)",
                "elapsed_s": round(time.time() - t0, 1),
-               "all_pass": ok, "results": results, "metrics": all_metrics}
+               "all_pass": ok, "results": results,
+               "metrics": {m: v for m, v in all_metrics.items() if v}}
     with open(os.path.join(ROOT, "validator", "results.json"), "w") as f:
         json.dump(summary, f, indent=2)
     print(f"\n{'ALL PASS' if ok else 'FAILURES'} in {summary['elapsed_s']}s")
