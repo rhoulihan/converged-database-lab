@@ -291,3 +291,74 @@ Metrics:
 - `s2-crossover-updates-per-1000-reads` (or `s2-no-crossover`);
 - `s2-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`;
 - `s2-meter-overhead-{reads|redo}`.
+
+### S4: one canonical form, two documents (`scripts/40-s4-two-projections.sql`)
+
+Stonebraker and Pavlo make two claims about document databases (section 2.3,
+p.23): "if the join is not one-to-many, then there will be duplicated data", and
+"there is no data independence". S4 answers both with one setup. It is a
+correctness check, not a measurement.
+
+The canonical form is three normalized tables: customers, orders, and order
+lines. Each customer's name is stored once, in the customer row. Two duality
+views project that one canonical form as two different documents:
+
+| View | Document | Can it change the customer name? |
+|---|---|---|
+| `m08s4_cust_dv` | a customer with its `orders[]`, each with its `lines[]` | yes |
+| `m08s4_ord_dv` | an order with its `lines[]` and a nested `customer {custId, name}` | no, the nested customer is read-only here |
+
+Customer 1 has 5 orders. The script changes customer 1's name once, through the
+customer-centric view (`JSON_TRANSFORM` on the document). Then it reads all 5
+order documents through the order-centric view. Every one shows the new name at
+once. There is no sync job and no fan-out update, because there is only one copy
+of the name to change.
+
+**What it proves.**
+
+- **No duplicated data.** The order-centric document shows the customer's name,
+  but the name is not copied into any order. A scan of every text and JSON
+  column in the S4 tables finds the new name exactly once (`s4-name-copies`),
+  and the order and line tables have no name column at all.
+- **Data independence.** One canonical form serves two document shapes. Neither
+  application has to know how the data is stored, and neither shape forces a
+  storage layout on the other. Adding the second shape took one view definition,
+  not a data migration.
+- **Clear ownership of each change.** The order-centric view can show the name
+  but cannot change it. The database refuses the attempt; only the
+  customer-centric view changes the name.
+
+The cost is real: each order document is assembled by a join on every read.
+S1, S1b and S2 measure that join. S4 shows what the join buys: one copy of the
+name, and any number of document shapes over it.
+
+Expected assertions:
+
+```
+ASSERT:s4-one-row-changed:PASS
+ASSERT:s4-order-view-reflects:PASS
+ASSERT:s4-no-copies:PASS
+ASSERT:s4-order-view-shape:PASS
+ASSERT:s4-order-view-customer-readonly:PASS
+ASSERT:s4-teardown-clean:PASS
+```
+
+- `s4-one-row-changed`: the view update changed one document, and exactly one
+  customer row holds the new name.
+- `s4-order-view-reflects`: all 5 order documents showed the old name before the
+  change, and all 5 show the new name after it.
+- `s4-no-copies`: the new name is stored exactly once, and orders and lines have
+  no name column.
+- `s4-order-view-shape`: the order document has its own fields plus
+  `customer.name` and no `orders` array; the customer document has an `orders`
+  array of 5 and no nested customer. The two projections really are different
+  shapes.
+- `s4-order-view-customer-readonly`: the dictionary marks the customer table
+  read-only in the order-centric view, and an attempt to change the name through
+  it is refused.
+
+Metrics:
+
+- `s4-docs-updated`;
+- `s4-order-docs-showing-new-name`;
+- `s4-name-copies`.
