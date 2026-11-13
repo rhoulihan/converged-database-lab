@@ -24,3 +24,31 @@ def test_duplicate_across_scripts_reported():
     mod = {"a": "1"}
     errs = merge_metrics(mod, {"a": "2", "b": "3"}, "02-x.sql")
     assert mod == {"a": "1", "b": "3"} and len(errs) == 1 and "a" in errs[0]
+
+# Host shell scripts (*.sh): run with bash; printed lines graded like JS output.
+import os, tempfile
+from run import run_sh
+
+def _sh(body):
+    fd, path = tempfile.mkstemp(suffix=".sh")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(body)
+    return path
+
+def test_sh_asserts_and_metrics_captured():
+    p = _sh('echo "ASSERT:sh-ok:PASS"\necho "METRIC:sh-m:4"\necho noise\n')
+    asserts, errors, metrics = run_sh(p)
+    os.remove(p)
+    assert asserts == ["ASSERT:sh-ok:PASS"] and errors == [] and metrics == {"sh-m": "4"}
+
+def test_sh_nonzero_rc_is_error():
+    p = _sh('echo "ASSERT:sh-x:PASS"\nexit 3\n')
+    asserts, errors, metrics = run_sh(p)
+    os.remove(p)
+    assert asserts == ["ASSERT:sh-x:PASS"] and len(errors) == 1 and "rc=3" in errors[0]
+
+def test_sh_malformed_metric_is_error():
+    p = _sh('echo "METRIC:bad:" >&2\n')
+    asserts, errors, metrics = run_sh(p)
+    os.remove(p)
+    assert asserts == [] and metrics == {} and len(errors) == 1 and "malformed" in errors[0]

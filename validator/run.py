@@ -10,6 +10,9 @@ Contract: scripts live in modules/NN-slug/scripts/, run in lexical order.
             lab-oracle) against the MongoDB API (port 27017). Lines printed as
             'ASSERT:<name>:PASS|FAIL' are assertions; 'METRIC:<name>:<value>' are
             measurements.
+  *.sh   -> executed on the host with bash (e.g. a deployment step that recycles
+            the API tier). Printed lines are graded like *.js output; rc != 0 is
+            a script error. The SQL connection is reopened after each *.sh script.
 Exit code 0 iff every assertion in every module is PASS and no script errors.
 A METRIC line that does not parse, or a METRIC name repeated within a module,
 is a script error; otherwise metrics never affect the exit code.
@@ -141,6 +144,18 @@ def run_js(path):
            "--file", "/dev/stdin"]
     with open(path, "rb") as fh:
         proc = subprocess.run(cmd, stdin=fh, capture_output=True, text=True, timeout=300)
+    return _grade_output(path, "mongosh", proc)
+
+def run_sh(path):
+    """Run a host shell script with bash; grade its printed lines like JS output.
+
+    Used for host-side steps such as recycling the API tier. Inherits the
+    environment, so LAB_CONTAINER / CONTAINER_ENGINE reach the script.
+    """
+    proc = subprocess.run(["bash", path], capture_output=True, text=True, timeout=900)
+    return _grade_output(path, "bash", proc)
+
+def _grade_output(path, tool, proc):
     # Newline-joined so a final stdout line without '\n' cannot fuse with stderr.
     out = proc.stdout + "\n" + proc.stderr
     # Keep the historical substring match for ASSERT (a line may carry a
@@ -149,7 +164,7 @@ def run_js(path):
     metrics, metric_errors = {}, []
     for line in out.splitlines():
         scan_metric(line, metrics, metric_errors)
-    errors = [] if proc.returncode == 0 else [f"{os.path.basename(path)}: mongosh rc={proc.returncode}\n{out[-800:]}"]
+    errors = [] if proc.returncode == 0 else [f"{os.path.basename(path)}: {tool} rc={proc.returncode}\n{out[-800:]}"]
     errors += [f"{os.path.basename(path)}: {e}" for e in metric_errors]
     return asserts, errors, metrics
 
@@ -168,6 +183,15 @@ def main():
                 asserts, errors, metrics = run_sql(path, conn)
             elif script.endswith(".js"):
                 asserts, errors, metrics = run_js(path)
+            elif script.endswith(".sh"):
+                asserts, errors, metrics = run_sh(path)
+                # A host script may restart the database (e.g. recycling the
+                # API tier), so later SQL scripts get a fresh connection.
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = oracledb.connect(user=USER, password=PWD, dsn=DSN)
             else:
                 continue
             errors += merge_metrics(all_metrics.setdefault(mod, {}), metrics, script)
