@@ -37,6 +37,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
+| S3 at scale (B) | `60` to `69` | "there is no data independence", and whether an unchanged app ever gains from a storage move | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads, CPU and elapsed time per call, from `v$sql`) and its plan captured. Results are the same at every stage. Costs are reported with no direction asserted; see the section for which statements got cheaper or slower and why. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -52,7 +53,9 @@ python3 validator/run.py
 The validator runs every module in order, then every script in this module in
 file-name order. The scripts depend on that order: `00` builds the meter that
 later scripts use, and the S3 stages build on each other. A full validator run
-(all modules) takes about a minute, much of it the API restart in `02b`.
+(all modules) takes about eight minutes. Most of it is S3 at scale (B): two
+API restarts (`02b` and `63`) and four stages of measured statements, where
+one aggregation alone takes 1.5 to 3.5 seconds per call for 21 calls.
 
 Numbers for the article come only from `validator/results.json`, under
 `"metrics"`.
@@ -63,15 +66,16 @@ The lab contract is that scripts leave the shared domain unchanged: the
 validator rolls back after each SQL script. This module bends that rule, and
 cleans up after itself.
 
-- **The S3 stage scripts commit on purpose.** `02`, `04` and `06` each move the
+- **The S3 and S3 (B) stage scripts commit on purpose.** `02`, `04` and `06`
+  (and `62`, `65` and `67` for S3 (B)) each move the
   storage one step and `COMMIT`, because the next stage has to see the change.
   The rollback after each script would otherwise undo the move.
 - **The S1, S1 (A), S1b and S2 scripts commit their test data.** They build their own
   `M08`-prefixed tables (DDL commits anyway) and commit the seeded rows so the
   measured statements read committed data.
-- **The cutover script recycles the API tier.** `02b-cutover-recycle-api.sh`
-  restarts the lab container so the MongoDB API re-reads the collection
-  details. The validator opens a new SQL connection after any `.sh` script.
+- **The cutover scripts recycle the API tier.** `02b-cutover-recycle-api.sh`
+  (and `63-s3b-cutover-recycle-api.sh`, which calls it) restarts the lab
+  container so the MongoDB API re-reads the collection details. The validator opens a new SQL connection after any `.sh` script.
 
 None of this touches the shared `ORDERS`, `ORDER_ITEMS` or `order_dv`. Every
 scenario drops its own objects and checks that it is clean,
@@ -665,13 +669,162 @@ Metrics:
 - `s5-docs-returned-k25` (documents that one request returned for the 25-line
   order).
 
+### S3 at scale (B): what the unchanged app pays at each stage (`scripts/60` to `scripts/69`)
+
+S3 shows that the same app code gets the same results while the storage
+moves, on 8 orders, and measures no cost. This runs the same four stages on a
+separate collection, `m08b3_orders`, with 20,000 orders, and measures what each
+unchanged app statement costs at each stage.
+
+**Data** (`60-s3b-seed.js`). 20,000 orders, seeded through the MongoDB API with
+`insertMany` in batches of 1,000 from a fixed-seed generator, so every run
+loads the same data. Each order has 5 to 15 lines `{lineId, sku, qty}` (200,050
+lines in all; `lineId` is unique across orders), a `customer` (2,000 values), a
+`status` (5 values; `open` is about 10%) and a `ship` address. There are 500
+skus: `SKU-HOT` is 1.5% of all lines (on 2,795 orders), `SKU-RARE` is on
+exactly 3 orders, and the other 498 are skewed toward the low numbers.
+
+**Stages and indexes.** Each stage gets the indexes a DBA would add for the
+statements' predicates. Statistics are gathered after every move.
+
+| Stage | Script | Storage under `m08b3_orders` | Indexes |
+|---|---|---|---|
+| 0 | `60` | a plain collection | `createIndex` on `items.sku` (multivalue) and on `status` |
+| 1 | `62` | a table with one JSON column, behind a duality view | the same two, rebuilt on the JSON column: a multivalue index on `data.items[*].sku` and an index on the JSON `status` value |
+| 2 | `65` | `customer` and `status` promoted to columns | a B-tree on the `status` column (the JSON `status` index is dropped); the multivalue sku index stays |
+| 3 | `67` | lines moved to `M08B3_LINES`, keyed by `line_id`; `order_id` is a NOT NULL foreign key, not selected | a B-tree on `M08B3_LINES.sku` and the foreign key index on `order_id` (the multivalue sku index is dropped) |
+
+`63-s3b-cutover-recycle-api.sh` restarts the API tier after the 0 to 1 move,
+as in S3. The stage-0 indexes are made on the empty collection, before the
+load: on this stack, `createIndex` on a loaded collection fails with
+ORA-00910, because `MAX_STRING_SIZE` is `STANDARD`. The stage-3 lines are
+loaded by one `INSERT ... SELECT`, so each order's lines sit together, which is
+the friendly layout for the view's join (S1 measures the interleaved one).
+
+**The app statements** (in `61`, `64`, `66` and `68`, which are byte-identical
+and work out the stage from the schema):
+
+| Name | Statement |
+|---|---|
+| `byid` | `find({_id: 12345})` |
+| `status` | `find({status: 'open'})` (2,057 documents) |
+| `sku-hot` | `find({'items.sku': 'SKU-HOT'})` (2,795 documents) |
+| `sku-rare` | `find({'items.sku': 'SKU-RARE'})` (3 documents) |
+| `agg-status` | `aggregate([{$match: {status: 'open'}}, {$group: {_id: '$customer', n: {$sum: 1}}}])` |
+| `agg-unwind` | `aggregate([{$unwind: '$items'}, {$group: {_id: '$items.sku', q: {$sum: '$items.qty'}}}])` |
+
+**How it is measured.** For each statement at each stage: `explain()` through
+the MongoDB API gives the SQL the API generated, its `sql_id` and the plan.
+One warm-up run, then 20 measured runs, each fetching every result document.
+Buffer gets (logical reads), CPU and elapsed time are the growth of `v$sql`
+for that `sql_id` over the 20 runs, divided by 20. The API sends the same SQL
+text at every stage (the `sql_id` does not change), because it queries the
+name `m08b3_orders`, whatever is behind it.
+
+**Results** (run of the validator that produced this README; the article
+takes its numbers from `validator/results.json`). Logical reads per call, with
+CPU per call in milliseconds in brackets:
+
+| Statement | Stage 0 (collection) | Stage 1 (view, JSON column) | Stage 2 (promoted columns) | Stage 3 (lines table) |
+|---|---|---|---|---|
+| `byid` | 3 (0.03) | 3 (0.05) | 3 (0.05) | 9 (0.06) |
+| `status` | 1,202 (2.8) | 1,526 (465) | 1,526 (46) | 7,376 (72) |
+| `sku-hot` | 1,389 (3.0) | 1,533 (496) | 1,533 (489) | 9,933 (109) |
+| `sku-rare` | 6 (0.02) | 1,508 (436) | 1,508 (424) | 2,402 (7.1) |
+| `agg-status` | 1,174 (11) | 1,508 (478) | 1,508 (57) | 20,198 (1,123) |
+| `agg-unwind` | 1,577 (1,501) | 1,508 (2,351) | 1,508 (2,337) | 17,302 (3,422) |
+
+**Plain reading.**
+
+- **No statement is cheaper at any later stage than on the plain collection.**
+  The best any of them does is tie (`byid` at stages 1 and 2).
+- **Stage 0 to 1, the day-one cost of putting a view in front: five of six
+  statements got slower; `byid` stayed the same.** The view hides the
+  collection's indexes from the app's predicates. The generated SQL tests a
+  JSON path on the view's document, and at stage 1 the database checks it
+  against a document it builds for every row: the plan is a full scan of
+  `M08B3_ORDERS_T` with `JSON_EXISTS2(JSON_OBJECT(...))` as the filter. The
+  multivalue and `status` indexes on the JSON column are not used. Reads move
+  only a little (a full scan of a 1,500-block table costs about what the old
+  index path cost for 2,000 to 2,800 documents), but building 20,000 documents
+  per call costs CPU: about 0.4 to 0.5 seconds for each find, where the
+  collection took 3 ms or less. `sku-rare` goes from 6 reads to 1,508.
+  `agg-unwind` reads about the same and uses 1.6 times the CPU.
+- **Stage 1 to 2: `status` and `agg-status` got cheaper; the other four stayed
+  the same.** With `status` a real column, the plan's filter becomes
+  `"T"."STATUS"=:1`, so the database no longer builds a document to test it.
+  CPU falls about tenfold (465 to 46 ms, 478 to 57 ms). Reads do not change:
+  the optimizer still scans the table rather than use the new `status` B-tree
+  for an estimated 4,000 rows. The sku statements still test the JSON items.
+- **Stage 2 to 3: `sku-rare` and `sku-hot` got cheaper in CPU but did more
+  reads; the other four got slower.**
+  - The `items.sku` test is now pushed down to the lines table, as a
+    semi-join on `M08B3_LINES.SKU` followed by the order's primary key. CPU
+    falls to 7 ms (`sku-rare`, from 424) and 109 ms (`sku-hot`, from 489). But
+    the lines are found by a full scan of `M08B3_LINES`, not by the new `sku`
+    B-tree (the optimizer estimates 402 rows for any sku, and the hot and rare
+    finds share one cursor), and every returned order then reads its lines
+    through the `order_id` index to build its `items` array. Reads rise to
+    2,402 and 9,933.
+  - `byid` and `status` now read each order's lines from a second table: 3 to
+    9 reads for one order, 1,526 to 7,376 for 2,057 orders.
+  - `agg-status` lost the `status` pushdown it had at stage 2. Its plan
+    filters on `JSON_EXISTS2` over a document that includes the lines
+    subquery, so all 20,000 orders are built, lines and all: 20,198 reads and
+    1.1 seconds per call.
+  - `agg-unwind` is not pushed down to a `GROUP BY` on `M08B3_LINES`. It still
+    expands each order's built `items` array, now with a lines lookup per
+    order: 17,302 reads and 3.4 seconds per call. (The plan text from
+    `explain()` does not show the per-order lines lookup; the reads do.)
+
+So the app keeps working, unchanged, at every stage, and gets the same results
+(S3 and these checks). It does not get faster here. On this stack, with these
+indexes and statistics and nothing tuned, every move away from the plain
+collection made most statements cost more, and a promoted column only won back
+part of what the view cost on day one. The duality view is a join, and it is
+measured as one. The data independence it buys is that the storage can move
+without breaking the app, not that the move makes the app cheaper.
+
+Expected assertions:
+
+```
+ASSERT:s3b-seeded:PASS
+ASSERT:s3b-stage1-rows:PASS
+ASSERT:s3b-api-recycled:PASS
+ASSERT:s3b-stage2-columns:PASS
+ASSERT:s3b-stage3-lines:PASS
+ASSERT:s3b-stage<N>-plans-captured:PASS            (N = 0 to 3)
+ASSERT:s3b-stage<N>-measured:PASS
+ASSERT:s3b-stage<N>-same-results:PASS
+ASSERT:s3b-stage<N>-normalizer-detects-change:PASS
+ASSERT:s3b-all-stages-same-results:PASS
+ASSERT:s3b-all-stages-plans-captured:PASS
+ASSERT:s3b-teardown-clean:PASS
+```
+
+- `same-results`: each statement's result, normalized (no `_metadata`, keys
+  sorted, numbers as plain numbers, every array sorted, so array and result
+  order do not count), hashes the same as at stage 0, with the same count.
+- `plans-captured`: every statement's `explain()` gave a `sql_id`, generated
+  SQL and a plan.
+- `measured`: each measured `sql_id` executed at least once per call, so the
+  `v$sql` numbers belong to the app's statement.
+- `normalizer-detects-change`: a changed document does not hash the same.
+- No check compares costs between stages.
+
+Metrics: `s3b-<statement>-stage<N>-gets`, `-cpu-us` and `-ela-us` (per call;
+CPU and elapsed in microseconds), for the six statements and four stages.
+Logical reads repeat closely from run to run; CPU and elapsed time are noisy on
+this shared container, so read them as sizes, not exact values.
+
 ## Teardown: `scripts/99-teardown.sql`
 
 Empties and drops the meter's session table `m08_metrics`, drops the
 `m08_meter` package, and then checks that nothing from this module is left in
 the schema. The check lists every name the module uses, matched without regard
-to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08S2_`, `M08S4_` and `M08S5_` (which
-covers the `m08s5_single` collection), and the S3 names `sales_orders`,
+to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08B3_`, `M08S2_`, `M08S4_` and
+`M08S5_` (which covers the `m08s5_single` collection, and `M08B3_` the
+`m08b3_orders` and `m08b3_runs` collections), and the S3 names `sales_orders`,
 `SALES_ORDERS_T`, `SALES_ORDER_LINES`, `SALES_ORDERS_V0` and `probe_runs`.
 
 Expected assertions:

@@ -27,6 +27,7 @@ select 'ASSERT:s08-module-clean:' ||
                    where upper(object_name) like 'M08\_%'   escape '\'
                       or upper(object_name) like 'M08A\_%'  escape '\'
                       or upper(object_name) like 'M08B\_%'  escape '\'
+                      or upper(object_name) like 'M08B3\_%' escape '\'
                       or upper(object_name) like 'M08S2\_%' escape '\'
                       or upper(object_name) like 'M08S4\_%' escape '\'
                       or upper(object_name) like 'M08S5\_%' escape '\'
