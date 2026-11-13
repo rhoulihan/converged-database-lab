@@ -1,6 +1,6 @@
 -- S2, duplication and write amplification, by change regime.
--- Stonebraker and Pavlo: "if the join is not one-to-many, then there will be
--- duplicated data". The duplication is real. What it costs depends on knob 2 (the
+-- Stonebraker and Pavlo (section 2.3, p.23): "if the join is not one-to-many,
+-- then there will be duplicated data". The duplication is real. What it costs depends on knob 2 (the
 -- write-to-read ratio) and knob 3 (which fields the writes change).
 --
 -- An order embeds a snapshot of its customer: {custId, name, tier} (the Extended
@@ -29,8 +29,12 @@
 --   crossover : q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
 -- Below q tier changes per 1,000 order reads, embedding does less work; above it,
 -- normalized storage does. Redo is a separate cost axis, recorded but not in the
--- crossover; it makes the write side worse still for embedding. The crossover is
--- approximate: a one-block change in any term moves it.
+-- crossover; it makes the write side worse still for embedding.
+-- Sensitivity: the read advantage (norm_read - emb_read) is one logical read, the
+-- customer index probe the embedded read avoids. It is zero when the customer
+-- index has a single level, which is why a 50-row customer table tied. The
+-- crossover scales directly with that gap: one block less erases it, one block
+-- more doubles it.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08s2_measure;
@@ -313,7 +317,8 @@ end;
 
 -- Crossover, in logical reads (formula in the header):
 --   q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads),
--- rounded to one decimal: here it is near 1, so whole numbers would hide it.
+-- rounded to one decimal, because the value is below 1 and a whole number would
+-- show it as 1 or 0.
 -- If the denominator is not positive, there is no crossover: s2-no-crossover = 1.
 declare
   function v(p_name varchar2) return number is
@@ -369,13 +374,6 @@ select 'ASSERT:s2-embedded-redo-gt-normalized:' ||
 select 'ASSERT:s2-embedded-read-cheaper:' ||
        case when (select value from m08_metrics where name = 's2-embedded-read-reads') <
                  (select value from m08_metrics where name = 's2-normalized-read-reads')
-            then 'PASS' else 'FAIL' end
-  from dual;
-
--- Immutable regime (0 customer updates per 1,000 order reads): embedded costs less in total.
-select 'ASSERT:s2-immutable-total-cheaper:' ||
-       case when 1000 * (select value from m08_metrics where name = 's2-embedded-read-reads') <
-                 1000 * (select value from m08_metrics where name = 's2-normalized-read-reads')
             then 'PASS' else 'FAIL' end
   from dual;
 

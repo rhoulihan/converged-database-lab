@@ -183,8 +183,8 @@ Metrics: `s1b-{childtable|childtable-plain|childtable-covered|orderdocs|orderdoc
 
 ### S2: duplicated data and what it costs to keep it in sync (`scripts/30-s2-write-amplification.sql`)
 
-Stonebraker and Pavlo point out that if the join is not one-to-many, "there will
-be duplicated data". That is true. S2 measures what the duplication costs, and
+Stonebraker and Pavlo point out (section 2.3, p.23): "if the join is not
+one-to-many, then there will be duplicated data". That is true. S2 measures what the duplication costs, and
 shows that the answer depends on how often the copied data changes.
 
 Each order embeds a snapshot of its customer, `{custId, name, tier}` (the Extended
@@ -231,10 +231,6 @@ records the depth of every index used.
 - **A field that changes is expensive to duplicate.** One tier change rewrites N
   documents embedded, and one row normalized. It costs far more logical reads
   and far more redo.
-- **A field that never changes costs nothing on the write side**, because nothing
-  ever rewrites it. That is the Extended Reference pattern: copy the fields that
-  never or rarely change (a name), and keep the volatile ones (a tier) behind a
-  reference.
 - **Reads go the other way.** The embedded order already holds the customer
   fields, so it skips the second index probe the join needs. The join is never
   free; it is one more lookup on every read.
@@ -250,11 +246,22 @@ crossover : q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_
 ```
 
 Below q tier changes per 1,000 order reads, embedding does less work in total;
-above it, normalized storage does. With N = 100 the crossover is about one
-change per 1,000 reads, so a field that changes this often should not be
-embedded. The crossover is approximate: a one-block change in any term moves it,
-which is why it is recorded to one decimal. It is computed on logical reads
-only. Redo is a separate cost axis, and it makes the write side worse still for
+above it, normalized storage does. The measured value is
+`s2-crossover-updates-per-1000-reads` in `validator/results.json`. It is
+recorded to one decimal because it is below 1, and a whole number would show it
+as 1 or 0. It is computed on logical reads only.
+
+The crossover is sensitive. The read advantage is one logical read: the customer
+index probe the embedded read avoids. That advantage is zero when the customer
+index has a single level, which is why a 50-row customer table tied. The
+crossover scales directly with that gap: one block less erases it, one block
+more doubles it.
+
+By the same reasoning (derived, not measured separately): embedding a field pays
+whenever the field changes less often than the crossover. An immutable field
+changes zero times, below any positive crossover. That is the Extended Reference
+pattern: copy the fields that never or rarely change (a name), and keep the
+volatile ones (a tier) behind a reference. Redo is a separate cost axis, and it makes the write side worse still for
 embedding. If no crossover exists, `s2-no-crossover` is 1.
 
 Expected assertions:
@@ -264,7 +271,6 @@ ASSERT:s2-embedded-touches-N:PASS
 ASSERT:s2-normalized-touches-1:PASS
 ASSERT:s2-embedded-redo-gt-normalized:PASS
 ASSERT:s2-embedded-read-cheaper:PASS
-ASSERT:s2-immutable-total-cheaper:PASS
 ASSERT:s2-crossover-positive:PASS
 ASSERT:s2-same-content:PASS
 ASSERT:s2-plans-indexed:PASS
