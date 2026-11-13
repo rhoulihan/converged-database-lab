@@ -28,4 +28,46 @@ ASSERT:m08-meter-ready:PASS
 
 ## Proofs
 
-_To be added as the demonstration scripts land._
+### S3: the same MongoDB API code while storage moves (`scripts/01` to `scripts/08`)
+
+The app code is the probe in `01-collection-baseline.js`; `03`, `05` and `07`
+run it again, byte for byte, after each storage move and compare every read and
+write result with the stage-0 baseline.
+
+| Stage | Script | Storage under the collection name `sales_orders` |
+|---|---|---|
+| 0 | `01-collection-baseline.js` | a plain collection |
+| 1 | `02-move-to-flex-view.sql` | a table with one JSON column, behind a duality view |
+| 2 | `04-promote-columns.sql` | `customer` and `status` promoted to real columns |
+| 3 | `06-move-lines-to-table.sql` | order lines moved to their own table |
+
+`02b-cutover-recycle-api.sh` restarts the lab container after the first move.
+Switching a collection to a duality view of the same name is a deployment
+event: the API tier must be restarted so it reads the new collection details.
+The later moves (view to view) need no restart.
+
+**Array order.** The stage-3 probe passes because the database happens to
+return each order's lines in the same order the app wrote them. In this lab the
+lines came back sorted by `lineId`, and the probe's `lineId`s ascend in the
+order they were written, so the two orders agree. That order is not
+guaranteed once an array lives in a table: a duality view cannot sort a nested
+array. `07b-stage3-array-order.js` writes an order whose lines are out of
+`lineId` order, checks that the same lines come back, and reports (as a metric,
+not a check) whether their order survived. An app that relies on array order
+should carry an ordering field in the document and sort by it.
+
+Expected assertions:
+
+```
+ASSERT:s3-stage0-captured:PASS
+ASSERT:s3-normalizer-detects-change:PASS
+ASSERT:s3-stage1-rows:PASS
+ASSERT:s3-api-recycled:PASS
+ASSERT:s3-stage-identical:PASS      (03, 05 and 07)
+ASSERT:s3-stage2-columns:PASS
+ASSERT:s3-stage3-lines:PASS
+ASSERT:s3-stage3-items-same-set:PASS
+ASSERT:s3-teardown-clean:PASS
+```
+
+Metric: `s3-stage3-order-preserved` (1 if the inserted order came back, else 0).
