@@ -2,12 +2,16 @@
 --   doc  : one document from a JSON collection table, found through its _id index
 --   join : the order row joined to its line rows
 --   dv   : the same order through a duality view (which is a join underneath)
---   n1   : one select for the order and its line keys, then one select per line
+--   n1   : the record-at-a-time interface: one query for the key list, then one
+--          fetch per line
 -- Each read runs twice; only the second run is measured (no parse cost).
 -- Cost is 'session logical reads' (buffer visits), corrected for the meter's own
 -- overhead. Target orders have k = 1, 10, 100 and 1000 lines, in two layouts:
---   clustered  : each order's lines are inserted together (best case for a join)
---   interleaved: lines arrive round-robin across 200 orders that are open at once
+--   clustered  : each order's lines are inserted together (what physical
+--                clustering buys)
+--   interleaved: lines arrive round-robin across 200 orders that are open at once,
+--                so about one block per line (a constructed upper bound: a heap
+--                with a single-column FK index)
 
 -- Clean up anything left by an earlier, interrupted run.
 drop view if exists m08_ord_dv;
@@ -230,7 +234,10 @@ BEGIN
 END;
 /
 
--- N+1: one select for the order and its line keys, then one select per line by key.
+-- Record-at-a-time interface: one query for the key list, then one fetch per line
+-- by primary key. This is the access style Stonebraker and Pavlo describe as "a
+-- lower-level, record-at-a-time interface" (SIGMOD Record 2024, section 2.3).
+-- The metric and marker names keep the short label n1.
 DECLARE
   TYPE t_num  IS TABLE OF NUMBER;
   TYPE t_str  IS TABLE OF VARCHAR2(20);
@@ -363,7 +370,7 @@ select 'ASSERT:s1-join-grows-' || l || ':' ||
   from ls
  order by l;
 
--- N+1 runs exactly k+1 statements (both layouts).
+-- The record-at-a-time reader runs exactly k+1 statements (both layouts).
 with ks as (select column_value k from table(sys.odcinumberlist(1, 10, 100, 1000)))
 select 'ASSERT:s1-n1-execs-k' || k || ':' ||
        case when (select value from m08_metrics where name = 's1-n1-k' || k || '-execs') = k + 1

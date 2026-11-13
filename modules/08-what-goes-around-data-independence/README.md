@@ -71,3 +71,48 @@ ASSERT:s3-teardown-clean:PASS
 ```
 
 Metric: `s3-stage3-order-preserved` (1 if the inserted order came back, else 0).
+
+### S1: read one order by key (`scripts/10-s1-read-by-key.sql`)
+
+One order and all of its lines are read four ways. Cost is counted as logical
+reads (buffer visits), measured on the second run of each read, with the
+meter's own overhead removed.
+
+| Reader | What it does |
+|---|---|
+| doc | one document from a JSON collection table, found through its `_id` index |
+| join | the order row joined to its line rows through the `order_id` index |
+| dv | the same document shape through a duality view, which is a join underneath |
+| n1 | the record-at-a-time interface: one query for the key list, then one fetch per line |
+
+The `n1` reader is the access style Stonebraker and Pavlo describe as "a
+lower-level, record-at-a-time interface" (SIGMOD Record 2024, section 2.3). The
+short label `n1` stays in the metric names.
+
+Target orders have 1, 10, 100 and 1,000 lines, in two layouts:
+
+- **clustered:** each order's lines are inserted together. This shows what
+  physical clustering buys.
+- **interleaved:** lines arrive round-robin across 200 orders that are open at
+  once, so each line lands in its own block: one block per line. This is a
+  constructed upper bound for a heap table with a single-column FK index.
+
+The document and duality-view readers serialize the document, so its bytes are
+really read; a client fetch costs the same.
+
+Expected assertions:
+
+```
+ASSERT:s1-same-content:PASS
+ASSERT:s1-interleaved-spread:PASS
+ASSERT:s1-doc-body-read:PASS
+ASSERT:s1-doc-le-join-<layout>-k<k>:PASS     (8)
+ASSERT:s1-dv-ge-doc-<layout>-k<k>:PASS       (8)
+ASSERT:s1-join-grows-<layout>:PASS           (2)
+ASSERT:s1-n1-execs-k<k>:PASS                 (4)
+ASSERT:s1-plans-indexed:PASS
+ASSERT:s1-teardown-clean:PASS
+```
+
+Metrics: `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`,
+`s1-n1-k{k}-execs`, `s1-meter-overhead-reads`, `s1-meter-overhead-execs`.
