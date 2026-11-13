@@ -15,7 +15,11 @@
 // They are created on the empty collection, before the load: on this stack,
 // createIndex on a loaded collection fails with ORA-00910 (MAX_STRING_SIZE is
 // STANDARD), and on an empty one it succeeds and indexes every later insert.
-// Statistics are gathered after the load, as at every later stage.
+// Statistics are gathered after the load, as at every later stage, with a
+// histogram on every indexed column (FOR ALL INDEXED COLUMNS SIZE 254), so the
+// optimizer sees the skew in status and sku. Gathered right after the load,
+// the default (SIZE AUTO) builds no histograms, because no query has used
+// the columns yet. Multivalue index columns cannot carry a histogram.
 
 const NAME = 'm08b3_orders';
 const N_ORDERS = 20000;
@@ -84,7 +88,7 @@ for (let i = 1; i <= N_ORDERS; i++) {
 }
 if (batch.length) col.insertMany(batch, { ordered: false });
 
-db.aggregate([{ $sql: `begin dbms_stats.gather_table_stats(user, '"${NAME}"', cascade => true); end;` }]).toArray();
+db.aggregate([{ $sql: `begin dbms_stats.gather_table_stats(user, '"${NAME}"', method_opt => 'FOR ALL COLUMNS SIZE AUTO FOR ALL INDEXED COLUMNS SIZE 254', cascade => true, no_invalidate => false); end;` }]).toArray();
 
 const idx = col.getIndexes().map((x) => Object.keys(x.key).join(',')).sort();
 const seeded = col.countDocuments({}) === N_ORDERS &&

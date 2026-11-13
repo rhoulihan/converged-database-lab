@@ -20,7 +20,7 @@ commit;
 create index m08b3_t_status_ix on m08b3_orders_t (status);
 
 begin
-  dbms_stats.gather_table_stats(user, 'M08B3_ORDERS_T', cascade => true);
+  dbms_stats.gather_table_stats(user, 'M08B3_ORDERS_T', method_opt => 'FOR ALL COLUMNS SIZE AUTO FOR ALL INDEXED COLUMNS SIZE 254', cascade => true, no_invalidate => false);
 end;
 /
 

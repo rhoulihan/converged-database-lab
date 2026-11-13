@@ -38,8 +38,8 @@ create index m08b3_lines_order_ix on m08b3_lines (order_id);
 create index m08b3_lines_sku_ix on m08b3_lines (sku);
 
 begin
-  dbms_stats.gather_table_stats(user, 'M08B3_ORDERS_T', cascade => true);
-  dbms_stats.gather_table_stats(user, 'M08B3_LINES', cascade => true);
+  dbms_stats.gather_table_stats(user, 'M08B3_ORDERS_T', method_opt => 'FOR ALL COLUMNS SIZE AUTO FOR ALL INDEXED COLUMNS SIZE 254', cascade => true, no_invalidate => false);
+  dbms_stats.gather_table_stats(user, 'M08B3_LINES', method_opt => 'FOR ALL COLUMNS SIZE AUTO FOR ALL INDEXED COLUMNS SIZE 254', cascade => true, no_invalidate => false);
 end;
 /
 
