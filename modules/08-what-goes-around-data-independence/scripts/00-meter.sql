@@ -29,18 +29,28 @@ CREATE OR REPLACE PACKAGE m08_meter AS
   PROCEDURE record(p_name VARCHAR2, p_value NUMBER);
   -- Runs the query p_sql once to warm it (parse and first execution are not
   -- measured), then p_runs more times. Each run is snap, execute, fetch every
-  -- row (1,000 rows per fetch call), delta. The meter's own overhead (snap then
-  -- delta with no work, measured once per call after one warm-up) is subtracted,
-  -- floored at 0. Records:
+  -- row (1,000 rows per fetch call), delta. It calls snap itself, so it
+  -- overwrites any snap the caller took before.
+  -- The meter's own overhead (snap then the same deltas with no work, measured
+  -- once per call after one warm-up) is subtracted from reads only, floored at
+  -- 0. CPU and elapsed are reported raw: at 1 cs resolution a single overhead
+  -- sample is noise. All three overheads are recorded for audit. Records:
   --   <p_name>-reads-median, -reads-max, -reads-min      ('session logical reads')
   --   <p_name>-cpu-cs-median, -cpu-cs-max                ('CPU used by this session')
   --   <p_name>-elapsed-cs-median, -elapsed-cs-max        (dbms_utility.get_time)
+  --   <p_name>-overhead-reads, -overhead-cpu-cs, -overhead-elapsed-cs
   -- The median of an even number of runs is the lower middle value (an
   -- observed run, never an average of two). p_sql must be a single SELECT or
-  -- WITH query. LOB columns are fetched as locators, so a query that must read
-  -- a document's bytes should select json_serialize(... returning blob), as S1
-  -- does.
-  PROCEDURE measure_repeat(p_name VARCHAR2, p_sql VARCHAR2, p_runs PLS_INTEGER DEFAULT 20);
+  -- WITH query, and p_name at most 80 bytes (the longest name must fit the
+  -- 100-byte metric name).
+  -- JSON and LOB columns: a bare column is fetched as a locator, so the
+  -- document or LOB body is never read and reads are under-counted. A JSON-type
+  -- column always raises ORA-20802; select json_serialize(<col> returning blob)
+  -- instead (it builds the whole document, as S1 does) and pass
+  -- p_allow_lob => TRUE. Any BLOB or CLOB column raises ORA-20802 unless
+  -- p_allow_lob is TRUE; read a stored LOB's bytes with dbms_lob instead.
+  PROCEDURE measure_repeat(p_name VARCHAR2, p_sql VARCHAR2, p_runs PLS_INTEGER DEFAULT 20,
+                           p_allow_lob BOOLEAN DEFAULT FALSE);
 END m08_meter;
 /
 
@@ -109,7 +119,7 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
 
   -- Defines every column of an open query cursor as an array of its own type,
   -- so each fetch call returns up to c_batch rows.
-  PROCEDURE define_all(p_cur INTEGER) IS
+  PROCEDURE define_all(p_cur INTEGER, p_allow_lob BOOLEAN) IS
     n    INTEGER;
     d    dbms_sql.desc_tab2;
     v_vc dbms_sql.varchar2_table;
@@ -136,9 +146,17 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
         WHEN d(i).col_type = 100       THEN dbms_sql.define_array(p_cur, i, v_bf, c_batch, 1);
         WHEN d(i).col_type = 101       THEN dbms_sql.define_array(p_cur, i, v_bd, c_batch, 1);
         WHEN d(i).col_type = 12        THEN dbms_sql.define_array(p_cur, i, v_d,  c_batch, 1);
+        WHEN d(i).col_type = 119 THEN
+          RAISE_APPLICATION_ERROR(-20802, 'm08_meter.measure_repeat: column ' || i
+            || ' is JSON and would be fetched as a locator (reads under-counted);'
+            || ' select json_serialize(<col> returning blob) with p_allow_lob => TRUE');
+        WHEN d(i).col_type IN (112, 113) AND NOT p_allow_lob THEN
+          RAISE_APPLICATION_ERROR(-20802, 'm08_meter.measure_repeat: column ' || i
+            || ' is a LOB and would be fetched as a locator (reads under-counted);'
+            || ' read its bytes with dbms_lob, or pass p_allow_lob => TRUE for a'
+            || ' serialized value such as json_serialize(<col> returning blob)');
         WHEN d(i).col_type = 112       THEN dbms_sql.define_array(p_cur, i, v_cl, c_batch, 1);
-        WHEN d(i).col_type IN (113, 119)
-                                       THEN dbms_sql.define_array(p_cur, i, v_bl, c_batch, 1);
+        WHEN d(i).col_type = 113       THEN dbms_sql.define_array(p_cur, i, v_bl, c_batch, 1);
         WHEN d(i).col_type = 180       THEN dbms_sql.define_array(p_cur, i, v_ts, c_batch, 1);
         WHEN d(i).col_type = 181       THEN dbms_sql.define_array(p_cur, i, v_tz, c_batch, 1);
         WHEN d(i).col_type = 231       THEN dbms_sql.define_array(p_cur, i, v_tl, c_batch, 1);
@@ -201,7 +219,8 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
     RETURN m;
   END min_of;
 
-  PROCEDURE measure_repeat(p_name VARCHAR2, p_sql VARCHAR2, p_runs PLS_INTEGER DEFAULT 20) IS
+  PROCEDURE measure_repeat(p_name VARCHAR2, p_sql VARCHAR2, p_runs PLS_INTEGER DEFAULT 20,
+                           p_allow_lob BOOLEAN DEFAULT FALSE) IS
     c     INTEGER;
     reads t_nums := t_nums();
     cpus  t_nums := t_nums();
@@ -219,6 +238,10 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
     IF NOT REGEXP_LIKE(p_sql, '^\s*(\(\s*)*(select|with)\s', 'i') THEN
       RAISE_APPLICATION_ERROR(-20804, 'm08_meter.measure_repeat: p_sql must be a query');
     END IF;
+    -- '-overhead-elapsed-cs' (20 bytes) is the longest suffix; names are VARCHAR2(100).
+    IF p_name IS NULL OR LENGTHB(p_name) + 20 > 100 THEN
+      RAISE_APPLICATION_ERROR(-20805, 'm08_meter.measure_repeat: p_name must be 1 to 80 bytes');
+    END IF;
 
     -- Meter overhead: snap then the same deltas with no work. One warm-up, then
     -- the measured one.
@@ -230,7 +253,7 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
     c := dbms_sql.open_cursor;
     BEGIN
       dbms_sql.parse(c, p_sql, dbms_sql.native);
-      define_all(c);
+      define_all(c, p_allow_lob);
       run_all(c);                       -- warm-up run, not measured
       reads.EXTEND(p_runs);
       cpus.EXTEND(p_runs);
@@ -240,8 +263,8 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
         run_all(c);
         take(r, cp, e);
         reads(i) := GREATEST(r  - o_r, 0);
-        cpus(i)  := GREATEST(cp - o_c, 0);
-        els(i)   := GREATEST(e  - o_e, 0);
+        cpus(i)  := cp;                  -- raw: see the spec comment
+        els(i)   := e;
       END LOOP;
       dbms_sql.close_cursor(c);
     EXCEPTION
@@ -257,6 +280,9 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
     record(p_name || '-cpu-cs-max',        max_of(cpus));
     record(p_name || '-elapsed-cs-median', median_low(els));
     record(p_name || '-elapsed-cs-max',    max_of(els));
+    record(p_name || '-overhead-reads',      o_r);
+    record(p_name || '-overhead-cpu-cs',     o_c);
+    record(p_name || '-overhead-elapsed-cs', o_e);
   END measure_repeat;
 END m08_meter;
 /
@@ -279,19 +305,55 @@ END;
 
 SELECT 'ASSERT:m08-meter-cpu-ready:' || CASE WHEN m08_meter.delta('CPU used by this session') >= 0 THEN 'PASS' ELSE 'FAIL' END FROM dual;
 
--- Repeat helper: measure a trivial query; all 7 metric rows must exist with
--- non-negative values. The rows are removed afterwards.
+-- Repeat helper self-test against a small real table (dropped at the end).
+drop table if exists m08_meter_selftest purge;
+
+create table m08_meter_selftest (id number primary key, s varchar2(50), j json);
+
+insert into m08_meter_selftest
+  select level, rpad('x', 50, 'x'), json_object('id' value level)
+    from dual connect by level <= 500;
+
 BEGIN
-  m08_meter.measure_repeat('m08-meter-selftest', 'select level n, rpad(''x'', 50, ''x'') s from dual connect by level <= 500');
+  m08_meter.measure_repeat('m08-meter-selftest', 'select id, s from m08_meter_selftest');
 END;
 /
 
+-- All 10 rows exist, none negative, reads min <= median <= max, and a real
+-- table read costs at least one logical read.
 SELECT 'ASSERT:m08-meter-repeat-ready:' ||
-       CASE WHEN COUNT(DISTINCT name) = 7 AND COUNT(*) = 7 AND MIN(value) >= 0 THEN 'PASS' ELSE 'FAIL' END
+       CASE WHEN COUNT(DISTINCT name) = 10 AND COUNT(*) = 10 AND MIN(value) >= 0
+             AND MAX(CASE WHEN name = 'm08-meter-selftest-reads-min'    THEN value END)
+              <= MAX(CASE WHEN name = 'm08-meter-selftest-reads-median' THEN value END)
+             AND MAX(CASE WHEN name = 'm08-meter-selftest-reads-median' THEN value END)
+              <= MAX(CASE WHEN name = 'm08-meter-selftest-reads-max'    THEN value END)
+             AND MAX(CASE WHEN name = 'm08-meter-selftest-reads-median' THEN value END) > 0
+            THEN 'PASS' ELSE 'FAIL' END
   FROM m08_metrics
  WHERE name IN ('m08-meter-selftest-reads-median', 'm08-meter-selftest-reads-max',
                 'm08-meter-selftest-reads-min', 'm08-meter-selftest-cpu-cs-median',
                 'm08-meter-selftest-cpu-cs-max', 'm08-meter-selftest-elapsed-cs-median',
-                'm08-meter-selftest-elapsed-cs-max');
+                'm08-meter-selftest-elapsed-cs-max', 'm08-meter-selftest-overhead-reads',
+                'm08-meter-selftest-overhead-cpu-cs', 'm08-meter-selftest-overhead-elapsed-cs');
 
-DELETE FROM m08_metrics WHERE name LIKE 'm08-meter-selftest-%';
+-- A bare JSON column would be fetched as a locator and under-count reads, so
+-- the helper must refuse it (ORA-20802).
+BEGIN
+  BEGIN
+    m08_meter.measure_repeat('m08-meter-selftest-json', 'select j from m08_meter_selftest', 1);
+    m08_meter.record('m08-meter-selftest-json-guard', 0);
+  EXCEPTION
+    WHEN OTHERS THEN
+      m08_meter.record('m08-meter-selftest-json-guard', CASE WHEN SQLCODE = -20802 THEN 1 ELSE 0 END);
+  END;
+END;
+/
+
+SELECT 'ASSERT:m08-meter-lob-guard:' ||
+       CASE WHEN (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-json-guard') = 1
+            THEN 'PASS' ELSE 'FAIL' END
+  FROM dual;
+
+DELETE FROM m08_metrics WHERE name LIKE 'm08-meter-selftest%';
+
+drop table if exists m08_meter_selftest purge;

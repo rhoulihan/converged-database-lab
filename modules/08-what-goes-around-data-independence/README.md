@@ -91,26 +91,37 @@ later scripts use to measure work. Safe to run more than once.
   (hundredths of a second).
 - `m08_meter.elapsed_cs` returns the centiseconds since the last `snap`.
 - `m08_meter.record(name, value)` stores a named measurement.
-- `m08_meter.measure_repeat(p_name, p_sql, p_runs => 20)` measures one query
-  many times:
+- `m08_meter.measure_repeat(p_name, p_sql, p_runs => 20, p_allow_lob => FALSE)`
+  measures one query many times. It takes its own `snap`, so it replaces any
+  `snap` the caller took before. `p_name` can be at most 80 bytes.
   - It runs the query once to warm it up, so parsing and the first execution
     are never measured. Then it runs it `p_runs` more times.
   - Each run executes the query and fetches every row, 1,000 rows per fetch
     call (like a client with an array size of 1,000), so the cost of reading the
-    rows is real. LOB columns come back as pointers, so a query that must read a
-    document's bytes should select `json_serialize(... returning blob)`.
+    rows is real.
+  - JSON and LOB columns: a bare column comes back as a pointer (a locator),
+    so the document or LOB body is never read and the reads are under-counted.
+    The helper refuses them (`ORA-20802`). For a document, select
+    `json_serialize(<col> returning blob)`, which builds the whole document,
+    and pass `p_allow_lob => TRUE`. To read a stored LOB's bytes, use
+    `dbms_lob`.
   - The meter's own cost (a `snap` and its deltas with no work in between) is
-    measured once per call and subtracted, never going below 0.
-  - It records `<p_name>-reads-median`, `-reads-max`, `-reads-min`,
-    `-cpu-cs-median`, `-cpu-cs-max`, `-elapsed-cs-median` and
-    `-elapsed-cs-max`. With an even number of runs the median is the lower of
-    the two middle values, so it is always a run that really happened.
+    measured once per call. It is subtracted from reads, never going below 0.
+    CPU and elapsed are reported as measured, with no subtraction, because one
+    overhead sample at one-centisecond resolution is just noise. All three
+    overheads are recorded so they can be checked.
+  - It records `<p_name>-reads-median`, `-reads-min`, `-reads-max`,
+    `-cpu-cs-median`, `-cpu-cs-max`, `-elapsed-cs-median`, `-elapsed-cs-max`,
+    `-overhead-reads`, `-overhead-cpu-cs` and `-overhead-elapsed-cs`. Reads
+    report min and max; CPU and elapsed report max. With an even number of runs
+    the median is the lower of the two middle values, so it is always a run
+    that really happened.
 
 Logical reads are exact and repeat run to run. CPU and elapsed time are not:
 they are measured on a single Free container that is shared with everything
 else on the host, so they are noisy and only accurate to one centisecond. That
-is why the helper reports the median over 20 runs together with the min or
-max, instead of a single run.
+is why the helper reports the median over 20 runs, with the max (and, for
+reads, the min), instead of a single run.
 
 Expected assertions:
 
@@ -118,6 +129,7 @@ Expected assertions:
 ASSERT:m08-meter-ready:PASS
 ASSERT:m08-meter-cpu-ready:PASS
 ASSERT:m08-meter-repeat-ready:PASS
+ASSERT:m08-meter-lob-guard:PASS
 ```
 
 ## Proofs
