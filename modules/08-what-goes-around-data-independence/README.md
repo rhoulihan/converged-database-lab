@@ -180,3 +180,108 @@ ASSERT:s1b-teardown-clean:PASS
 Metrics: `s1b-{childtable|childtable-plain|childtable-covered|orderdocs|orderdocs-jsontable|orderdocs-serialized|itemdv|doc|join}-k{10|100|1000}-reads`,
 `s1b-doc-bytes-k{k}`, `s1b-crossover-item-queries-per-1000-order-reads-k{k}` (or
 `s1b-no-crossover-k{k}`), `s1b-meter-overhead-reads`.
+
+### S2: duplicated data and what it costs to keep it in sync (`scripts/30-s2-write-amplification.sql`)
+
+Stonebraker and Pavlo point out that if the join is not one-to-many, "there will
+be duplicated data". That is true. S2 measures what the duplication costs, and
+shows that the answer depends on how often the copied data changes.
+
+Each order embeds a snapshot of its customer, `{custId, name, tier}` (the Extended
+Reference pattern). Customer 1 has N = 100 orders, spread out over time among
+20,000 orders of other customers.
+
+| Model | How it is stored |
+|---|---|
+| embedded | order documents in a JSON collection table, each carrying the customer snapshot, with an index on the embedded `custId` |
+| normalized | an orders table with a plain `cust_id` column (indexed) that points to one customer row |
+
+**Two kinds of cost.**
+
+- **Logical reads** count buffer visits: how many blocks a statement looks at. They
+  measure the work of finding and changing data.
+- **Redo** counts the bytes of change log the database writes so every change can
+  be recovered. It measures write volume: log disk, network to standbys, and
+  backups.
+
+Each statement is measured on its second run, with the meter's own overhead
+removed.
+
+| Measurement | Embedded | Normalized |
+|---|---|---|
+| one tier change | rewrite every document that embeds the customer (`JSON_TRANSFORM`, found through the `custId` index) | update one customer row by primary key |
+| one order read with its customer fields | the document by `_id`, serialized so its body is really read | the order row joined to its customer row by key |
+
+The normalized read is measured on two plans, and the cheaper one counts:
+
+- **primary keys:** the order row, then the customer row;
+- **covering indexes:** both answered from index entries alone. The order index
+  holds every order column, so it works like an index-organized orders table.
+
+The normalized tier change also pays to maintain the customer covering index,
+because that index holds `tier`.
+
+**Sizing.** The customer table has 100,000 rows. With a toy-sized customer table,
+the normalized read's extra index probe hides inside one index block. At
+100,000 customers the index has a realistic depth. `s2-idx-<name>-blevel`
+records the depth of every index used.
+
+**What the numbers show.**
+
+- **A field that changes is expensive to duplicate.** One tier change rewrites N
+  documents embedded, and one row normalized. It costs far more logical reads
+  and far more redo.
+- **A field that never changes costs nothing on the write side**, because nothing
+  ever rewrites it. That is the Extended Reference pattern: copy the fields that
+  never or rarely change (a name), and keep the volatile ones (a tier) behind a
+  reference.
+- **Reads go the other way.** The embedded order already holds the customer
+  fields, so it skips the second index probe the join needs. The join is never
+  free; it is one more lookup on every read.
+
+**Knobs 2 and 3: how often writes happen, and which fields they change.** With
+logical reads as the work unit for reads and updates alike, for 1,000 order
+reads plus q customer tier changes:
+
+```
+embedded  : 1000*emb_read  + q*emb_update_reads
+normalized: 1000*norm_read + q*norm_update_reads
+crossover : q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
+```
+
+Below q tier changes per 1,000 order reads, embedding does less work in total;
+above it, normalized storage does. With N = 100 the crossover is about one
+change per 1,000 reads, so a field that changes this often should not be
+embedded. The crossover is approximate: a one-block change in any term moves it,
+which is why it is recorded to one decimal. It is computed on logical reads
+only. Redo is a separate cost axis, and it makes the write side worse still for
+embedding. If no crossover exists, `s2-no-crossover` is 1.
+
+Expected assertions:
+
+```
+ASSERT:s2-embedded-touches-N:PASS
+ASSERT:s2-normalized-touches-1:PASS
+ASSERT:s2-embedded-redo-gt-normalized:PASS
+ASSERT:s2-embedded-read-cheaper:PASS
+ASSERT:s2-immutable-total-cheaper:PASS
+ASSERT:s2-crossover-positive:PASS
+ASSERT:s2-same-content:PASS
+ASSERT:s2-plans-indexed:PASS
+ASSERT:s2-teardown-clean:PASS
+```
+
+`s2-same-content` checks two things, before and after the tier change:
+
+- both models return the same order and customer fields;
+- every embedded copy carries the new tier.
+
+Metrics:
+
+- `s2-{embedded-update-docs|normalized-update-rows}`;
+- `s2-{embedded|normalized}-update-{reads|redo}`;
+- `s2-embedded-read-reads`, `s2-normalized-read-{pk|covered}-reads`, and
+  `s2-normalized-read-reads` (the cheaper of the two);
+- `s2-crossover-updates-per-1000-reads` (or `s2-no-crossover`);
+- `s2-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`;
+- `s2-meter-overhead-{reads|redo}`.
