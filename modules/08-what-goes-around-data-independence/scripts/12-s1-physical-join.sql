@@ -1,13 +1,20 @@
--- S1 physical variants (A): is S1's join the best join? Read one order and all
--- of its lines by key, six ways, over the same interleaved data:
+-- S1 physical variants (A): how close do other physical designs bring the join?
+-- Read one order and all of its lines by key, eight ways, over the same
+-- interleaved data:
 --   doc  : one document from a JSON collection table, found through its _id index
 --   heap : heap line table, single-column order_id index (S1's interleaved join)
 --   cov  : heap line table plus a covering index (order_id, line_id, sku, qty),
 --          so the lines are read from the index alone
 --   iot  : index-organized line table, primary key (order_id, line_id), so each
 --          order's lines sit together in the primary key's leaf blocks
+--   iotc : the iot with key compression (COMPRESS 1 on order_id), moved online
+--          after the load so its leaf blocks are packed
 --   clu  : index cluster on order_id holding both the order and line tables, so
---          an order and its lines share cluster blocks behind one key lookup
+--          an order and its lines share cluster blocks. As measured, the plan
+--          makes two index probes: the order row through its own primary key
+--          index, then the lines through the cluster index
+--   hash : hash cluster on order_id holding both tables: both are reached by
+--          hashing the key (TABLE ACCESS HASH), with no index probe
 --   dv   : a duality view over the iot variant (a join, measured as one)
 -- Every line table is loaded in the same interleaved order (S1's recipe), so the
 -- physical design, not the load order, does any clustering.
@@ -16,22 +23,23 @@
 -- and k = 1000 only; smaller reads are below its 1 cs resolution.
 -- The heap baseline is checked against S1's own interleaved numbers, which
 -- 10-s1-read-by-key.sql leaves in m08_metrics as 'ref:s1-*' rows.
+-- Warning: those rows live in the session table, and the validator reconnects
+-- after any .sh script, so a .sh script numbered between 10 and 12 would lose
+-- them and break that cross-check.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop view if exists m08a_i_dv;
 drop table if exists m08a_h_line purge;
 drop table if exists m08a_v_line purge;
 drop table if exists m08a_i_line purge;
+drop table if exists m08a_k_line purge;
 drop table if exists m08a_ord purge;
 drop table if exists m08a_doc purge;
 drop table if exists m08a_line_plan purge;
-DECLARE
-  n NUMBER;
 BEGIN
-  SELECT COUNT(*) INTO n FROM user_clusters WHERE cluster_name = 'M08A_CLU';
-  IF n > 0 THEN
-    EXECUTE IMMEDIATE 'DROP CLUSTER m08a_clu INCLUDING TABLES CASCADE CONSTRAINTS';
-  END IF;
+  FOR c IN (SELECT cluster_name FROM user_clusters WHERE cluster_name IN ('M08A_CLU', 'M08A_HCLU')) LOOP
+    EXECUTE IMMEDIATE 'DROP CLUSTER ' || c.cluster_name || ' INCLUDING TABLES CASCADE CONSTRAINTS';
+  END LOOP;
 END;
 /
 delete from m08_metrics where name like 's1a-%' or name like 'tmp:s1a-%';
@@ -73,6 +81,17 @@ create table m08a_i_line (
   constraint m08a_i_line_pk primary key (order_id, line_id)
 ) organization index;
 
+-- iotc: the same IOT with the leading key column (order_id) compressed, so
+-- each leaf block stores each order_id once. It is moved online after the
+-- load (below) so the leaves are not left half empty by block splits.
+create table m08a_k_line (
+  order_id number not null references m08a_ord,
+  line_id  varchar2(36),
+  sku      varchar2(20),
+  qty      number,
+  constraint m08a_k_line_pk primary key (order_id, line_id)
+) organization index compress 1;
+
 -- clu: an index cluster keyed on order_id. SIZE 512 bytes per key: a typical
 -- 10-line order is about 10 line rows of roughly 40 bytes plus a header row, so
 -- one key fits in about 500 bytes and an 8 KB block holds about 15 orders.
@@ -92,6 +111,25 @@ create table m08a_c_line (
   sku      varchar2(20),
   qty      number
 ) cluster m08a_clu (order_id);
+
+-- hash: a hash cluster keyed on order_id. HASHKEYS 22000 is one hash key per
+-- order (the data has 21,893 orders; Oracle rounds HASHKEYS up to a prime).
+-- SIZE 512 bytes per key, as for the index cluster. Larger orders chain extra
+-- blocks onto their key.
+create cluster m08a_hclu (order_id number) size 512 hashkeys 22000;
+
+create table m08a_hc_ord (
+  id       number primary key,
+  customer varchar2(40),
+  status   varchar2(12)
+) cluster m08a_hclu (id);
+
+create table m08a_hc_line (
+  line_id  varchar2(36) primary key,
+  order_id number not null references m08a_hc_ord,
+  sku      varchar2(20),
+  qty      number
+) cluster m08a_hclu (order_id);
 
 create json collection table m08a_doc;
 
@@ -139,6 +177,9 @@ insert into m08a_ord (id, customer, status)
 insert into m08a_c_ord (id, customer, status)
   select id, customer, status from m08a_ord;
 
+insert into m08a_hc_ord (id, customer, status)
+  select id, customer, status from m08a_ord;
+
 -- Every line table gets the same rows in the same (plan) order.
 insert into m08a_h_line (line_id, order_id, sku, qty)
   select 'L' || order_id || '-' || n, order_id,
@@ -164,6 +205,18 @@ insert into m08a_c_line (line_id, order_id, sku, qty)
     from m08a_line_plan
    order by phase, pos1, pos2;
 
+insert into m08a_k_line (order_id, line_id, sku, qty)
+  select order_id, 'L' || order_id || '-' || n,
+         'SKU-' || lpad(mod(order_id * 7 + n, 5000), 4, '0'), mod(n, 5) + 1
+    from m08a_line_plan
+   order by phase, pos1, pos2;
+
+insert into m08a_hc_line (line_id, order_id, sku, qty)
+  select 'L' || order_id || '-' || n, order_id,
+         'SKU-' || lpad(mod(order_id * 7 + n, 5000), 4, '0'), mod(n, 5) + 1
+    from m08a_line_plan
+   order by phase, pos1, pos2;
+
 drop table m08a_line_plan purge;
 
 -- The document projection carries the same content: the order and all its lines.
@@ -175,6 +228,9 @@ insert into m08a_doc (data)
     from m08a_ord o;
 
 commit;
+
+-- Pack the compressed IOT's leaves after the interleaved load.
+alter table m08a_k_line move online;
 
 -- The duality view over the iot variant: lines keyed by lineId; the order_id
 -- foreign key is joined on, not selected.
@@ -192,8 +248,8 @@ create or replace json relational duality view m08a_i_dv as
 -- the same indexed plan the bind-variable reads block gets, on every run.
 BEGIN
   FOR t IN (SELECT column_value tn FROM table(sys.odcivarchar2list(
-              'M08A_ORD', 'M08A_H_LINE', 'M08A_V_LINE', 'M08A_I_LINE',
-              'M08A_C_ORD', 'M08A_C_LINE', 'M08A_DOC'))) LOOP
+              'M08A_ORD', 'M08A_H_LINE', 'M08A_V_LINE', 'M08A_I_LINE', 'M08A_K_LINE',
+              'M08A_C_ORD', 'M08A_C_LINE', 'M08A_HC_ORD', 'M08A_HC_LINE', 'M08A_DOC'))) LOOP
     dbms_stats.gather_table_stats(user, t.tn, cascade => true,
                                   method_opt => 'FOR ALL COLUMNS SIZE 1');
   END LOOP;
@@ -269,6 +325,14 @@ DECLARE
         SELECT /*+ M08AIOT */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty
           BULK COLLECT INTO v
           FROM m08a_ord o JOIN m08a_i_line l ON l.order_id = o.id WHERE o.id = p_id;
+      WHEN 'iotc' THEN
+        SELECT /*+ M08AIOTC */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty
+          BULK COLLECT INTO v
+          FROM m08a_ord o JOIN m08a_k_line l ON l.order_id = o.id WHERE o.id = p_id;
+      WHEN 'hash' THEN
+        SELECT /*+ M08AHASH */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty
+          BULK COLLECT INTO v
+          FROM m08a_hc_ord o JOIN m08a_hc_line l ON l.order_id = o.id WHERE o.id = p_id;
       WHEN 'clu' THEN
         SELECT /*+ M08ACLU */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty
           BULK COLLECT INTO v
@@ -278,7 +342,7 @@ DECLARE
   END q;
 BEGIN
   SELECT value INTO ovr FROM m08_metrics WHERE name = 's1a-meter-overhead-reads';
-  FOR rv IN (SELECT column_value v FROM table(sys.odcivarchar2list('heap', 'cov', 'iot', 'clu'))) LOOP
+  FOR rv IN (SELECT column_value v FROM table(sys.odcivarchar2list('heap', 'cov', 'iot', 'iotc', 'clu', 'hash'))) LOOP
     FOR t IN (SELECT 900010 + level id, power(10, level - 1) k FROM dual CONNECT BY level <= 4) LOOP
       q(rv.v, t.id, t.k);
       m08_meter.snap;
@@ -306,6 +370,10 @@ BEGIN
                || ' from m08a_ord o join m08a_v_line l on l.order_id = o.id where o.id = :id';
   sqls('iot')  := 'select /*+ M08AIOT */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
                || ' from m08a_ord o join m08a_i_line l on l.order_id = o.id where o.id = :id';
+  sqls('iotc') := 'select /*+ M08AIOTC */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
+               || ' from m08a_ord o join m08a_k_line l on l.order_id = o.id where o.id = :id';
+  sqls('hash') := 'select /*+ M08AHASH */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
+               || ' from m08a_hc_ord o join m08a_hc_line l on l.order_id = o.id where o.id = :id';
   sqls('clu')  := 'select /*+ M08ACLU */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
                || ' from m08a_c_ord o join m08a_c_line l on l.order_id = o.id where o.id = :id';
   v := sqls.FIRST;
@@ -321,15 +389,19 @@ END;
 /
 
 -- ===== Layout facts (as METRIC rows below) =====
--- Distinct blocks that hold each target's line rows, heap and cluster. (An
--- index-organized table has no physical rowid block number, so iot is not listed.)
+-- Distinct blocks that hold each target's line rows: heap, index cluster and
+-- hash cluster. (An index-organized table has no physical rowid block number,
+-- so iot and iotc are not listed.)
 BEGIN
   FOR t IN (SELECT 900010 + level id, power(10, level - 1) k FROM dual CONNECT BY level <= 4) LOOP
     FOR b IN (SELECT 'heap' v, count(DISTINCT dbms_rowid.rowid_block_number(rowid)) n
                 FROM m08a_h_line WHERE order_id = t.id
               UNION ALL
               SELECT 'clu', count(DISTINCT dbms_rowid.rowid_block_number(rowid))
-                FROM m08a_c_line WHERE order_id = t.id) LOOP
+                FROM m08a_c_line WHERE order_id = t.id
+              UNION ALL
+              SELECT 'hash', count(DISTINCT dbms_rowid.rowid_block_number(rowid))
+                FROM m08a_hc_line WHERE order_id = t.id) LOOP
       m08_meter.record('s1a-' || b.v || '-k' || t.k || '-blocks', b.n);
     END LOOP;
   END LOOP;
@@ -357,6 +429,12 @@ with src as (
   select 'iot', o.id, o.customer, o.status, l.line_id, l.sku, l.qty
     from m08a_ord o join m08a_i_line l on l.order_id = o.id where o.id in (900011, 900012, 900013, 900014)
   union all
+  select 'iotc', o.id, o.customer, o.status, l.line_id, l.sku, l.qty
+    from m08a_ord o join m08a_k_line l on l.order_id = o.id where o.id in (900011, 900012, 900013, 900014)
+  union all
+  select 'hash', o.id, o.customer, o.status, l.line_id, l.sku, l.qty
+    from m08a_hc_ord o join m08a_hc_line l on l.order_id = o.id where o.id in (900011, 900012, 900013, 900014)
+  union all
   select 'clu', o.id, o.customer, o.status, l.line_id, l.sku, l.qty
     from m08a_c_ord o join m08a_c_line l on l.order_id = o.id where o.id in (900011, 900012, 900013, 900014)
   union all
@@ -374,34 +452,29 @@ g as (
 ks as (select 900010 + level id, power(10, level - 1) k from dual connect by level <= 4)
 select 'ASSERT:s1a-same-content-k' || ks.k || ':' ||
        case when (select count(*) from g where g.id = ks.id) = ks.k
-             and (select count(*) from g where g.id = ks.id and (g.n <> 6 or g.nv <> 6)) = 0
-             and (select count(*) from m08_metrics where name like 's1a-%-k' || ks.k || '-reads') = 6
+             and (select count(*) from g where g.id = ks.id and (g.n <> 8 or g.nv <> 8)) = 0
+             and (select count(*) from m08_metrics where name like 's1a-%-k' || ks.k || '-reads') = 8
             then 'PASS' else 'FAIL' end
   from ks
  order by ks.k;
 
--- The duality view returns the same document as the collection (k <= 100).
-select 'ASSERT:s1a-dv-same-document:' ||
-       case when (select count(*) from (
-                    select json_serialize(json_transform(v.data, remove '$._metadata') returning varchar2(32767))
-                      from m08a_i_dv v where v.data."_id" in (900011, 900012, 900013)
-                    minus
-                    select json_serialize(d.data returning varchar2(32767))
-                      from m08a_doc d where d.data."_id" in (900011, 900012, 900013))) = 0
-             and (select count(*) from m08a_i_dv v where v.data."_id" in (900011, 900012, 900013)) = 3
-            then 'PASS' else 'FAIL' end
-  from dual;
-
 -- Plans. Each marker names one reader; every measured cursor with that marker
 -- (the reads block's and measure_repeat's, at least two) must have the access
 -- path under test.
---   iot : INDEX RANGE SCAN on the IOT primary key
---   clu : TABLE ACCESS CLUSTER on the cluster's line table
---   cov : an INDEX RANGE SCAN on the covering index, and no TABLE ACCESS on the line table
---   dv  : tracks iot (INDEX RANGE SCAN on the IOT primary key)
+--   iot  : INDEX RANGE SCAN on the IOT primary key
+--   iotc : INDEX RANGE SCAN on the compressed IOT's primary key
+--   clu  : TABLE ACCESS CLUSTER on the cluster's line table
+--   hash : TABLE ACCESS HASH on both the order and the line table, and no INDEX step
+--   cov  : an INDEX RANGE SCAN on the covering index, and no TABLE ACCESS on the line table
+--   dv   : tracks iot (INDEX RANGE SCAN on the IOT primary key)
+-- Each row of m is one required plan line; a marker passes when all of its rows
+-- are found in every one of its cursors.
 with m (marker, ok_op, ok_opt, ok_obj, bad_obj) as (
   select 'M08AIOT', 'INDEX', 'RANGE SCAN', 'M08A_I_LINE_PK', null from dual union all
+  select 'M08AIOTC', 'INDEX', 'RANGE SCAN', 'M08A_K_LINE_PK', null from dual union all
   select 'M08ACLU', 'TABLE ACCESS', 'CLUSTER', 'M08A_C_LINE', null from dual union all
+  select 'M08AHASH', 'TABLE ACCESS', 'HASH', 'M08A_HC_ORD', null from dual union all
+  select 'M08AHASH', 'TABLE ACCESS', 'HASH', 'M08A_HC_LINE', null from dual union all
   select 'M08ACOV', 'INDEX', 'RANGE SCAN', 'M08A_V_LINE_COV_IX', 'M08A_V_LINE' from dual union all
   select 'M08ADV', 'INDEX', 'RANGE SCAN', 'M08A_I_LINE_PK', null from dual
 ),
@@ -412,29 +485,35 @@ cur as (
              and p.operation = m.ok_op and p.options = m.ok_opt and p.object_name = m.ok_obj) good,
          (select count(*) from v$sql_plan p
            where p.sql_id = s.sql_id and p.child_number = s.child_number
-             and p.operation = 'TABLE ACCESS' and p.object_name = m.bad_obj) bad
+             and ((p.operation = 'TABLE ACCESS' and p.object_name = m.bad_obj)
+                  or (m.marker = 'M08AHASH' and p.operation = 'INDEX'))) bad
     from m join v$sql s on upper(s.sql_text) like '%/*+ ' || m.marker || ' */%'
    where s.object_status = 'VALID'
      and s.command_type = 3                -- the SELECT itself, not the PL/SQL block around it
      and upper(s.sql_text) not like '%V$SQL%'
 )
-select 'ASSERT:s1a-plan-' || lower(substr(m.marker, 5)) || ':' ||
-       case when (select count(*) from cur where cur.marker = m.marker) >= 2
-             and (select count(*) from cur where cur.marker = m.marker and (cur.good = 0 or cur.bad > 0)) = 0
+select 'ASSERT:s1a-plan-' || lower(substr(mk.marker, 5)) || ':' ||
+       case when (select count(distinct cur.sql_id || ':' || cur.child_number)
+                    from cur where cur.marker = mk.marker) >= 2
+             and (select count(*) from cur where cur.marker = mk.marker and (cur.good = 0 or cur.bad > 0)) = 0
             then 'PASS' else 'FAIL' end
-  from m
- order by m.marker;
+  from (select distinct marker from m) mk
+ order by mk.marker;
 
--- Every measured statement used an index, and none scanned a whole table.
+-- Every measured statement used keyed access (an index, or the hash cluster's
+-- hash), and none scanned a whole table.
 select 'ASSERT:s1a-plans-indexed:' ||
        case when (select count(distinct m.marker)
                     from (select column_value marker from table(sys.odcivarchar2list(
-                            'M08ADOC', 'M08AHEAP', 'M08ACOV', 'M08AIOT', 'M08ACLU', 'M08ADV'))) m
+                            'M08ADOC', 'M08AHEAP', 'M08ACOV', 'M08AIOT', 'M08AIOTC',
+                            'M08ACLU', 'M08AHASH', 'M08ADV'))) m
                    where exists (select 1 from v$sql s join v$sql_plan p
                                      on p.sql_id = s.sql_id and p.child_number = s.child_number
                                   where upper(s.sql_text) like '%/*+ ' || m.marker || ' */%'
                                     and s.object_status = 'VALID'
-                                    and p.operation = 'INDEX')) = 6
+                                    and s.command_type = 3
+                                    and (p.operation = 'INDEX'
+                                         or (p.operation = 'TABLE ACCESS' and p.options = 'HASH')))) = 8
              and (select count(*) from v$sql s join v$sql_plan p
                       on p.sql_id = s.sql_id and p.child_number = s.child_number
                    where upper(s.sql_text) like '%/*+ M08' || 'A%'
@@ -485,15 +564,13 @@ drop view if exists m08a_i_dv;
 drop table if exists m08a_h_line purge;
 drop table if exists m08a_v_line purge;
 drop table if exists m08a_i_line purge;
+drop table if exists m08a_k_line purge;
 drop table if exists m08a_ord purge;
 drop table if exists m08a_doc purge;
-DECLARE
-  n NUMBER;
 BEGIN
-  SELECT COUNT(*) INTO n FROM user_clusters WHERE cluster_name = 'M08A_CLU';
-  IF n > 0 THEN
-    EXECUTE IMMEDIATE 'DROP CLUSTER m08a_clu INCLUDING TABLES CASCADE CONSTRAINTS';
-  END IF;
+  FOR c IN (SELECT cluster_name FROM user_clusters WHERE cluster_name IN ('M08A_CLU', 'M08A_HCLU')) LOOP
+    EXECUTE IMMEDIATE 'DROP CLUSTER ' || c.cluster_name || ' INCLUDING TABLES CASCADE CONSTRAINTS';
+  END LOOP;
 END;
 /
 

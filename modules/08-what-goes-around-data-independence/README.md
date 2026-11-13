@@ -32,7 +32,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
 | S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does no more logical reads than the best indexed join, in both a clustered and an interleaved layout. The join's cost grows with the number of lines. The duality view is a join and costs at least as much as the document. |
-| S1 (A) | `12-s1-physical-join.sql` | the same claim, against the strongest join | S1's join used a heap table with a single-column index. This reruns the interleaved case against a covering index, an index-organized table (IOT), an index cluster and a duality view over the IOT, and reports the reads with no direction asserted between the document and any join. |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, against the physical designs measured here | S1's join used a heap table with a single-column index. This reruns the interleaved case against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster and a duality view over the IOT, and reports the reads with no direction asserted between the document and any join. The hash cluster beats the document for orders of up to 100 lines; at 1,000 lines the document does the fewest reads. |
 | S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, when such a crossover exists. |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
@@ -238,30 +238,37 @@ that its heap baseline reproduces them. That script removes the rows.
 A fair objection to S1: its join reads a heap table through a single-column
 `order_id` index, so in the interleaved layout every line is its own block.
 Oracle has physical designs that keep an order's lines together whatever order
-they arrive in. This script measures them. It builds its own data (prefix
-`M08A_`) with S1's interleaved recipe and loads every line table in that same
-interleaved order, so any clustering comes from the physical design, not from
-the load order.
+they arrive in. This script measures seven of them. It builds its own data
+(prefix `M08A_`) with S1's interleaved recipe and loads every line table in
+that same interleaved order, so any clustering comes from the physical design,
+not from the load order.
 
-| Reader | Storage | How the lines are found |
+| Reader | Storage | Plan, as measured |
 |---|---|---|
 | doc | JSON collection table | one document by its `_id` index, serialized so the body is read |
-| heap | heap table, index on `order_id` | S1's interleaved join: one table block per line |
-| cov | heap table, covering index `(order_id, line_id, sku, qty)` | an index range scan; the table is never visited |
-| iot | index-organized table, primary key `(order_id, line_id)` | an index range scan; the rows live in the index, sorted by order |
-| clu | index cluster on `order_id` holding the order and line tables | one cluster index lookup, then the order's cluster blocks |
+| heap | heap table, index on `order_id` | order by primary key, then an index range scan and one table block per line (S1's interleaved join) |
+| cov | heap table, covering index `(order_id, line_id, sku, qty)` | order by primary key, then an index range scan; the line table is never visited |
+| iot | index-organized table (IOT), primary key `(order_id, line_id)` | order by primary key, then a range scan of the IOT, whose rows live in the index sorted by order |
+| iotc | the same IOT with key compression (`COMPRESS 1`), moved online after the load so its leaf blocks are packed | as iot |
+| clu | index cluster on `order_id` holding the order and line tables | two index probes: the order row through its own primary key index, then the lines through the cluster index (`TABLE ACCESS CLUSTER`) |
+| hash | hash cluster on `order_id` holding the order and line tables | no index probe: both tables are reached by hashing the key (`TABLE ACCESS HASH` on each) |
 | dv | duality view over the iot tables | the iot join, built into a document (a join, measured as one) |
 
-The cluster is sized `SIZE 512`: a typical 10-line order is about 10 line rows
-of roughly 40 bytes plus its header row, so about 500 bytes per key and about
-15 orders per 8 KB block. The 1,000-line order chains extra blocks onto its key.
+Sizing. The index cluster is `SIZE 512`: a typical 10-line order is about 10
+line rows of roughly 40 bytes plus its header row, so about 500 bytes per key
+and about 15 orders per 8 KB block. The hash cluster is `SIZE 512 HASHKEYS
+22000`: the same bytes per key, and one hash key per order (the data has
+21,893 orders; Oracle rounds `HASHKEYS` up to a prime). In both clusters the
+1,000-line order chains extra blocks onto its key. Nothing was tuned beyond
+this sizing.
 
 Statistics are gathered without histograms (`SIZE 1`). With the default
 (`SIZE AUTO`), a histogram on `order_id` appears or not depending on when the
 database last flushed its column-usage data, and when it appears the optimizer
 reads the heap table's 1,000-line order with a full table scan (about 1,000
 reads instead of about 900). Without histograms every reader gets the same
-indexed plan on every run, and the plan checks below hold it there.
+keyed plan on every run, and the plan checks below hold it there. This choice
+favors the join side: it keeps the heap join on its cheaper plan.
 
 Every reader returns the same content: the order and all of its lines. Reads
 are counted on the second run with the meter overhead removed, as in S1. CPU
@@ -270,41 +277,60 @@ and k = 1,000 only, since smaller reads are below its one-centisecond
 resolution. On the lab container they are also below it at k = 1,000: the
 medians are 0 cs for every reader, so time does not separate them here.
 
-**What it shows.** The physical designs close most of the gap, and that is the
-honest headline. At 1,000 lines the IOT, the cluster and the duality view over
-the IOT need about a dozen logical reads where the heap join needs about 900.
-The covering index is close behind. On the lab container none of them did
-fewer reads than the document at any k, so the document is still the cheapest
-read, but only by a few reads, not by the large factor the heap baseline
-shows. To get that close, the join needs a physical design picked for this one
-access pattern (lines stored by order), which is the same choice the document
-makes. The script asserts no direction between the document and any join; the
-numbers are in `validator/results.json`.
+**What it shows.** Logical reads from one validator run on the lab container
+(the article takes its numbers from `validator/results.json`):
+
+| k | doc | heap join | best of the other joins | best join vs doc |
+|---|---|---|---|---|
+| 1 | 3 | 7 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
+| 10 | 3 | 15 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
+| 100 | 3 | 95 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
+| 1000 | 8 | 894 | compressed IOT: 10 | the document wins (8 vs 10) |
+
+The physical designs measured here close most of the gap, and that is the
+honest headline. Against the heap join the document does about 100 times fewer
+reads at 1,000 lines. Against the other designs measured here the gap is at
+most about 2 times, and one design wins outright. The IOT, compressed IOT, index cluster, covering index and
+duality view need 6 or 7 reads up to 100 lines (the document needs 3) and 10
+to 14 at 1,000 lines (the document needs 8). **The hash cluster beats the
+document for orders of 1, 10 and 100 lines**: 2 reads against 3, because it
+reaches the order row and its lines by hashing the key, with no index at all.
+At 1,000 lines its chained blocks cost 14 reads, and the document wins. So
+of the seven join designs measured here, one beats the document for small and
+medium orders, and none beats it for the 1,000-line order. Every design that
+gets close stores the lines by order, chosen for this one access pattern,
+which is the same choice the document makes. Not tried here: a cluster where
+the order row is also read through the cluster key instead of its own primary
+key index, larger cluster `SIZE` values, partitioning by `order_id`, and
+caching layers (the result cache or the In-Memory column store). The script
+asserts no direction between the document and any join.
 
 Expected assertions:
 
 ```
-ASSERT:s1a-same-content-k<k>:PASS            (4)
-ASSERT:s1a-dv-same-document:PASS
+ASSERT:s1a-same-content-k<k>:PASS            (4) all 8 readers, same rows
 ASSERT:s1a-plan-clu:PASS                     TABLE ACCESS CLUSTER on the line table
 ASSERT:s1a-plan-cov:PASS                     covering index range scan, no TABLE ACCESS on the line table
 ASSERT:s1a-plan-dv:PASS                      INDEX RANGE SCAN on the IOT primary key
+ASSERT:s1a-plan-hash:PASS                    TABLE ACCESS HASH on both tables, no INDEX step
 ASSERT:s1a-plan-iot:PASS                     INDEX RANGE SCAN on the IOT primary key
-ASSERT:s1a-plans-indexed:PASS
+ASSERT:s1a-plan-iotc:PASS                    INDEX RANGE SCAN on the compressed IOT's primary key
+ASSERT:s1a-plans-indexed:PASS                keyed access everywhere, no full scans
 ASSERT:s1a-heap-matches-s1-k<k>:PASS         (4) heap within 5 reads of S1's join, doc within 2 of S1's doc
 ASSERT:s1a-clu-colocated:PASS
 ASSERT:s1a-teardown-clean:PASS
 ```
 
 `s1a-heap-matches-s1-k<k>` needs S1's `ref:s1-*` rows, so it fails if this
-script runs without `10-s1-read-by-key.sql` before it in the same session.
+script runs without `10-s1-read-by-key.sql` before it in the same session (or
+if a `.sh` script, after which the validator reconnects, runs between them).
 
 Metrics:
 
-- `s1a-{doc|heap|cov|iot|clu|dv}-k{1|10|100|1000}-reads` (second-run reads);
+- `s1a-{doc|heap|cov|iot|iotc|clu|hash|dv}-k{1|10|100|1000}-reads` (second-run reads);
 - `s1a-{reader}-k{100|1000}-{reads-median|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max|overhead-reads}`
   (from `measure_repeat`);
-- `s1a-{heap|clu}-k{k}-blocks` (distinct blocks holding the target's lines);
+- `s1a-{heap|clu|hash}-k{k}-blocks` (distinct blocks holding the target's lines);
 - `s1a-meter-overhead-reads`.
 
 ### S1b: find the line items with one sku (`scripts/20-s1b-child-centric.sql`)
