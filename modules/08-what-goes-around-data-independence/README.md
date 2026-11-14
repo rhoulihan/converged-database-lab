@@ -35,6 +35,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | S1 (A) | `12-s1-physical-join.sql` | the same claim, against the physical designs measured here | S1's join used a heap table with a single-column index. This reruns the interleaved case against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster and a duality view over the IOT, and reports the reads with no direction asserted between the document and any join. The hash cluster beats the document for orders of up to 100 lines; at 1,000 lines the document does the fewest reads. |
 | S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, when such a crossover exists. |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
+| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the same claims, against the objection that the S1b and S2 crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. Each crossover falls about in inverse proportion to its parameter; a crossover exists at every point. |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
 | S3 at scale (B) | `60` to `69` | "there is no data independence", and whether an unchanged app ever gains from a storage move | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads, CPU and elapsed time per call, from `v$sql`) and its plan captured. Results are the same at every stage. Costs are reported with no direction asserted; see the section for which statements got cheaper or slower and why. |
@@ -53,7 +54,7 @@ python3 validator/run.py
 The validator runs every module in order, then every script in this module in
 file-name order. The scripts depend on that order: `00` builds the meter that
 later scripts use, and the S3 stages build on each other. A full validator run
-(all modules) takes about eight minutes. Most of it is S3 at scale (B): two
+(all modules) takes about nine minutes. Most of it is S3 at scale (B): two
 API restarts (`02b` and `63`) and four stages of measured statements, where
 one aggregation alone takes 1.5 to 3.5 seconds per call for 21 calls.
 
@@ -70,7 +71,7 @@ cleans up after itself.
   (and `62`, `65` and `67` for S3 (B)) each move the
   storage one step and `COMMIT`, because the next stage has to see the change.
   The rollback after each script would otherwise undo the move.
-- **The S1, S1 (A), S1b and S2 scripts commit their test data.** They build their own
+- **The S1, S1 (A), S1b, S2 and sweep (C) scripts commit their test data.** They build their own
   `M08`-prefixed tables (DDL commits anyway) and commit the seeded rows so the
   measured statements read committed data.
 - **The cutover scripts recycle the API tier.** `02b-cutover-recycle-api.sh`
@@ -523,6 +524,150 @@ Metrics:
 - `s2-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`;
 - `s2-meter-overhead-{reads|redo}`.
 
+### Sweeps (C): how much the S1b and S2 crossovers depend on their parameters (`scripts/21-s1b-selectivity-sweep.sql`, `scripts/31-s2-fanout-sweep.sql`)
+
+A fair objection to S1b and S2: each crossover was computed at one chosen
+parameter. S1b fixed the item query at 20 matching orders, and S2 fixed the
+fan-out at N = 100 orders per customer. These two scripts sweep those
+parameters and report what happens. Nothing was tuned per point.
+
+Both scripts gather statistics with a histogram on every indexed column
+(`FOR ALL COLUMNS SIZE 1 FOR ALL INDEXED COLUMNS SIZE 254`), so the optimizer
+knows how many rows each sku or customer has and is free to pick a different
+plan at each point. The item readers and the embedded update carry no hints.
+Each point uses its own literal (sku `XM5`, `XM20`, ... or customer 1, 2, 3),
+so each point gets its own cursor and plan. The executed plan of every
+measured statement is captured with `dbms_xplan.display_cursor(...,
+'ALLSTATS LAST')` and printed as `PLAN:` rows (the validator ignores them; run
+the script alone to see them). Reads are counted on the second execution, with
+the meter's overhead removed, as in S1b and S2.
+
+**S1b sweep (prefix `M08C1_`).** One data load per order size: 2,000 filler
+orders of 10 lines and 500 matching orders of k lines (k = 100, then k =
+1,000), clustered. The swept skus are nested: `XM500` is in one line of every
+matching order, `XM100` in every 5th, `XM20` in every 25th and `XM5` in every
+100th, so M = 5, 20, 100 and 500 matching orders. The readers are S1b's final
+design: the child table (no hint; the optimizer picks the covering index
+`(sku, line_id, qty)` at every M), the order documents (the cheaper of the
+`JSON_TABLE` reader and the serialized reader, both through the multivalue
+index), and S1's order read by key (`doc` and `join`), which does not depend on
+M. At every point the serialized reader is the cheaper document reader, so it
+is the one that counts. (The `JSON_TABLE` reader's second execution is
+sometimes re-parsed by statistics feedback, because the multivalue index's
+row estimate is 1; that adds about 12 reads to its count at k = 100, M = 100
+and 500. Its `measure_repeat` medians, 102 and 503, equal the serialized
+reader's.) The crossover formula is S1b's:
+
+```
+q = 1000 * (join - doc) / (orderdocs - childtable)
+```
+
+Logical reads from one validator run on the lab container (the article takes
+its numbers from `validator/results.json`):
+
+| k | M | childtable | orderdocs | doc | join | crossover q (item queries per 1,000 order reads) |
+|---|---|---|---|---|---|---|
+| 100 | 5 | 2 | 7 | 3 | 6 | 600 |
+| 100 | 20 | 2 | 22 | 3 | 6 | 150 |
+| 100 | 100 | 2 | 102 | 3 | 6 | 30 |
+| 100 | 500 | 4 | 503 | 3 | 6 | 6 |
+| 1000 | 5 | 3 | 33 | 8 | 14 | 200 |
+| 1000 | 20 | 3 | 123 | 8 | 14 | 50 |
+| 1000 | 100 | 3 | 603 | 8 | 14 | 10 |
+| 1000 | 500 | 5 | 2649 | 8 | 14 | 2 |
+
+The k = 1,000 join read is 14 in one validator run and 15 in another. One read
+in the numerator moves every k = 1,000 crossover by about 15% (200 to 233 at
+M = 5, 2 to 3 at M = 500), as S1b warned. The k = 100 figures were the same in
+both runs.
+
+**How strongly it depends on M: about in inverse proportion.** The child table
+answers from the covering index in 2 to 5 reads whatever M is. The order
+documents pay about one block per matching order at k = 100 (the document fits
+in its row, about 5 KB) and about five to six blocks per matching order at
+k = 1,000 (about 50 KB, stored out of the row). So the denominator grows about
+linearly with M, the numerator does not change, and the crossover falls about
+as 1/M: 100 times more matching orders gives a crossover about 100 times
+lower (600 to 6 at k = 100, 200 to 2 at k = 1,000). The S1b crossover at 20
+matching orders is one point on this curve, not a constant. What does not
+change is the direction: at every point a crossover exists, and above it the
+normalized tables do fewer reads. (At M = 20 the k = 100 crossover here is 150,
+against 250 in S1b: S1b's join read 8 blocks on its data and this one reads 6.
+A two-block change in the numerator moves the crossover by that much.)
+
+**S2 sweep (prefix `M08C2_`).** One data load: S2's 100,000 customers, and
+21,110 orders. Customers 1, 2 and 3 have N = 10, 100 and 1,000 orders, spread
+evenly through the order ids; every other order belongs to its own customer.
+The models and statements are S2's. The normalized read is measured on both
+plans (primary keys, covering indexes) and the cheaper counts; the embedded
+update has no hint, and the optimizer, which sees 1,000 rows for customer 3 in
+the histogram, still picks the `custId` index at every N. The crossover formula
+is S2's, on logical reads, with redo reported separately. The embedded update
+reads move by a few blocks from run to run (124 to 126 at N = 10), so the
+second decimal of the crossover is not stable:
+
+```
+q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
+```
+
+| N | docs touched | embedded update reads | embedded update redo (bytes) | normalized update reads / redo | emb_read | norm_read | crossover q (tier changes per 1,000 order reads) |
+|---|---|---|---|---|---|---|---|
+| 10 | 10 | 124 | 13,904 | 7 / 784 | 3 | 4 | 8.55 |
+| 100 | 100 | 1,100 | 125,936 | 7 / 784 | 3 | 4 | 0.91 |
+| 1000 | 1,000 | 10,239 | 1,169,968 | 7 / 784 | 3 | 4 | 0.10 |
+
+**How strongly it depends on N: in inverse proportion.** The embedded update
+costs about 10 to 12 reads and about 1,200 bytes of redo per embedded copy, so
+its cost grows linearly with N, while the read advantage stays at one logical
+read (the customer index probe the embedded read skips) at every N. The
+crossover therefore falls as 1/N: about 8.5 tier changes per 1,000 order reads
+at N = 10, 0.91 at N = 100 (S2's 0.9) and 0.10 at N = 1,000. A customer with ten
+times more orders can change its tier ten times less often before embedding
+stops paying. S2's number holds only at N = 100. What does not change is the
+direction: a crossover exists at every N.
+
+**Time.** CPU and elapsed medians come from 20 timed runs. For the S1b sweep
+they are from `m08_meter.measure_repeat` for the item readers at M = 100 and
+500; for the S2 sweep, from a loop of 20 embedded updates at N = 100 and 1,000,
+each committed after it is measured. At the meter's one-centisecond
+resolution the child table reads 0 cs everywhere, the order documents 2 cs at
+k = 100, M = 500 (1 to 2 cs) and 3 to 14 cs at k = 1,000, and the embedded update 0 cs at
+N = 100 and 3 cs at N = 1,000. Each timed copy runs the same plan as the
+counted cursor (`s1c-timed-same-plan`, `s2c-timed-same-plan`).
+
+Expected assertions:
+
+```
+ASSERT:s1c-same-content-k<k>-m<M>:PASS       (8) childtable, jsontable and the client-filtered serialized orders return the same M pairs
+ASSERT:s1c-plans-captured:PASS               every measured statement has an ALLSTATS plan with Buffers
+ASSERT:s1c-plans-indexed:PASS                no full table scan; the order-document readers use the multivalue index at every M
+ASSERT:s1c-childtable-covered:PASS           the child-table reader uses the covering index with no line-table visit at every M
+ASSERT:s1c-timed-same-plan:PASS              each measure_repeat copy ran the counted cursor's plan
+ASSERT:s1c-crossover-recorded:PASS           a positive crossover or s1c-k<k>-m<M>-no-crossover at every point
+ASSERT:s1c-teardown-clean:PASS
+ASSERT:s2c-embedded-touches-N-n<N>:PASS      (3) docs touched = N, normalized rows touched = 1
+ASSERT:s2c-same-content-n<N>:PASS            (3) same fields before and after, every copy carries the new tier
+ASSERT:s2c-plans-captured:PASS               every measured statement has an ALLSTATS plan with Buffers and an index step
+ASSERT:s2c-reads-indexed:PASS                no full table scan on the reads; the covering read visits no table
+ASSERT:s2c-timed-same-plan:PASS              each timed update ran the counted cursor's plan
+ASSERT:s2c-crossover-recorded:PASS           a positive crossover or s2c-n<N>-no-crossover at every N
+ASSERT:s2c-teardown-clean:PASS
+```
+
+No assertion checks the direction of any crossover or how it moves with M or N.
+
+Metrics:
+
+- `s1c-k{100|1000}-m{5|20|100|500}-{childtable|orderdocs|orderdocs-jsontable|orderdocs-serialized}-reads`;
+- `s1c-k{k}-{doc|join}-reads`, `s1c-k{k}-doc-bytes`;
+- `s1c-k{k}-m{M}-crossover-item-queries-per-1000-order-reads` (or `s1c-k{k}-m{M}-no-crossover`);
+- `s1c-k{k}-m{100|500}-{reader}-{reads-median|reads-min|reads-max|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max|overhead-*}` (from `measure_repeat`);
+- `s2c-n{10|100|1000}-{embedded-update-docs|normalized-update-rows}`, `s2c-n{N}-{embedded|normalized}-update-{reads|redo}`;
+- `s2c-n{N}-embedded-read-reads`, `s2c-n{N}-normalized-read-{pk|covered}-reads`, `s2c-n{N}-normalized-read-reads`;
+- `s2c-n{N}-crossover-updates-per-1000-reads` (or `s2c-n{N}-no-crossover`);
+- `s2c-n{100|1000}-embedded-update-{timed-reads-median|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max}`;
+- `s2c-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`, `s1c-meter-overhead-reads`, `s2c-meter-overhead-{reads|redo}`.
+
 ### S4: one canonical form, two documents (`scripts/40-s4-two-projections.sql`)
 
 Stonebraker and Pavlo make two claims about document databases (section 2.3,
@@ -881,8 +1026,8 @@ The executed plans need two grants beyond the earlier ones, in
 Empties and drops the meter's session table `m08_metrics`, drops the
 `m08_meter` package, and then checks that nothing from this module is left in
 the schema. The check lists every name the module uses, matched without regard
-to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08B3_`, `M08S2_`, `M08S4_` and
-`M08S5_` (which covers the `m08s5_single` collection, and `M08B3_` the
+to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08B3_`, `M08C1_`, `M08C2_`, `M08S2_`,
+`M08S4_` and `M08S5_` (which covers the `m08s5_single` collection, and `M08B3_` the
 `m08b3_orders` and `m08b3_runs` collections), and the S3 names `sales_orders`,
 `SALES_ORDERS_T`, `SALES_ORDER_LINES`, `SALES_ORDERS_V0` and `probe_runs`.
 
