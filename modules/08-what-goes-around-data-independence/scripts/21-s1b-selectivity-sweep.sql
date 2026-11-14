@@ -27,7 +27,8 @@
 -- as in S1b. Crossover per point, the same formula as S1b:
 --   q = 1000 * (join - doc) / (orderdocs - childtable)
 -- It exists only when both terms are positive; otherwise
--- s1c-no-crossover-k<k>-m<M> = 1 is recorded. CPU and elapsed medians
+-- s1c-k<k>-m<M>-no-crossover = 1 is recorded. The crossover is rounded to two
+-- decimals, so a small value is not shown as a whole number or as 0. CPU and elapsed medians
 -- (m08_meter.measure_repeat, 20 runs, 1 cs resolution) are recorded for the
 -- item readers at M = 100 and 500.
 
@@ -369,7 +370,8 @@ end;
 /
 
 -- Crossover per point (formula in the header). It exists only when both terms
--- are positive; otherwise s1c-no-crossover-k<k>-m<M> = 1 is recorded.
+-- are positive; otherwise s1c-k<k>-m<M>-no-crossover = 1 is recorded. Rounded
+-- to two decimals.
 declare
   function v(p_name varchar2) return number is
     x number;
@@ -387,7 +389,7 @@ begin
       begin
         if num > 0 and den > 0 then
           m08_meter.record(p || '-m' || m.m || '-crossover-item-queries-per-1000-order-reads',
-                           round(num / den));
+                           round(num / den, 2));
         else
           m08_meter.record(p || '-m' || m.m || '-no-crossover', 1);
         end if;
@@ -398,7 +400,9 @@ end;
 /
 
 -- ===== Measurements (as METRIC rows) and executed plans (as PLAN rows) =====
-select 'METRIC:' || name || ':' || to_char(value, 'FM999999990')
+select 'METRIC:' || name || ':' ||
+       case when value = trunc(value) then to_char(value, 'FM999999990')
+            else to_char(value, 'FM999999990.00') end
   from m08_metrics
  where name like 's1c-%'
  order by name;
@@ -455,7 +459,7 @@ select 'ASSERT:s1c-timed-same-plan:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- The crossover exists (a positive whole number), or the no-crossover row is
+-- The crossover exists (a positive number), or the no-crossover row is
 -- recorded, at every point; never both, never neither.
 with pts as (select k.column_value k, m.column_value m
                from table(sys.odcinumberlist(100, 1000)) k,

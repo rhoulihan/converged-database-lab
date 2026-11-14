@@ -534,7 +534,9 @@ parameters and report what happens. Nothing was tuned per point.
 Both scripts gather statistics with a histogram on every indexed column
 (`FOR ALL COLUMNS SIZE 1 FOR ALL INDEXED COLUMNS SIZE 254`), so the optimizer
 knows how many rows each sku or customer has and is free to pick a different
-plan at each point. The item readers and the embedded update carry no hints.
+plan at each point. In the S1b sweep this informs only the child-table side:
+the multivalue index's row estimate stays 1 whatever M is (its hidden column
+gets no usable histogram), so the order-document plans are chosen without it. The item readers and the embedded update carry no hints.
 Each point uses its own literal (sku `XM5`, `XM20`, ... or customer 1, 2, 3),
 so each point gets its own cursor and plan. The executed plan of every
 measured statement is captured with `dbms_xplan.display_cursor(...,
@@ -556,7 +558,19 @@ is the one that counts. (The `JSON_TABLE` reader's second execution is
 sometimes re-parsed by statistics feedback, because the multivalue index's
 row estimate is 1; that adds about 12 reads to its count at k = 100, M = 100
 and 500. Its `measure_repeat` medians, 102 and 503, equal the serialized
-reader's.) The crossover formula is S1b's:
+reader's.)
+
+At k = 1,000 the plan `Buffers` column does not show the documents' full cost.
+Plan buffers cover row sources only. The out-of-row LOB bodies are read while
+the documents are serialized, outside any row source, so the serialized
+reader's plan shows 8, 23, 103 and 149 buffers at M = 5, 20, 100 and 500
+against 33, 123, 603 and 2,649 session logical reads, and the k = 1,000 `doc`
+plan shows 3 against 8. The session-level reads are the cost, and they are
+what the tables below use. The visible evidence is in the `JSON_TABLE` plan,
+where the LOB reads land in a row source: its `JSONTABLE EVALUATION` step
+shows 2,500 buffers at M = 500.
+
+The crossover formula is S1b's, rounded to two decimals:
 
 ```
 q = 1000 * (join - doc) / (orderdocs - childtable)
@@ -570,15 +584,15 @@ its numbers from `validator/results.json`):
 | 100 | 5 | 2 | 7 | 3 | 6 | 600 |
 | 100 | 20 | 2 | 22 | 3 | 6 | 150 |
 | 100 | 100 | 2 | 102 | 3 | 6 | 30 |
-| 100 | 500 | 4 | 503 | 3 | 6 | 6 |
+| 100 | 500 | 4 | 503 | 3 | 6 | 6.01 |
 | 1000 | 5 | 3 | 33 | 8 | 14 | 200 |
 | 1000 | 20 | 3 | 123 | 8 | 14 | 50 |
 | 1000 | 100 | 3 | 603 | 8 | 14 | 10 |
-| 1000 | 500 | 5 | 2649 | 8 | 14 | 2 |
+| 1000 | 500 | 5 | 2649 | 8 | 14 | 2.27 |
 
-The k = 1,000 join read is 14 in one validator run and 15 in another. One read
+The k = 1,000 join read was 14 in three validator runs and 15 in one. One read
 in the numerator moves every k = 1,000 crossover by about 15% (200 to 233 at
-M = 5, 2 to 3 at M = 500), as S1b warned. The k = 100 figures were the same in
+M = 5, 2.27 to 2.65 at M = 500), as S1b warned. The k = 100 figures were the same in
 both runs.
 
 **How strongly it depends on M: about in inverse proportion.** The child table
@@ -588,10 +602,18 @@ in its row, about 5 KB) and about five to six blocks per matching order at
 k = 1,000 (about 50 KB, stored out of the row). So the denominator grows about
 linearly with M, the numerator does not change, and the crossover falls about
 as 1/M: 100 times more matching orders gives a crossover about 100 times
-lower (600 to 6 at k = 100, 200 to 2 at k = 1,000). The S1b crossover at 20
+lower (600 to 6.01 at k = 100, 200 to 2.27 at k = 1,000). The S1b crossover at 20
 matching orders is one point on this curve, not a constant. What does not
 change is the direction: at every point a crossover exists, and above it the
-normalized tables do fewer reads. (At M = 20 the k = 100 crossover here is 150,
+normalized tables do fewer reads.
+
+The numerator is the order read by key against the heap order-plus-lines
+join, as in S1b. Against the best physical join measured in S1 (A), the hash
+cluster, the order read does not favor documents at k up to 100 (the hash
+cluster reads 2 blocks against the document's 3), so at k = 100 there would
+be no crossover: the normalized side wins both queries. At k = 1,000 the
+document still wins the order read (S1 (A)). This was not re-measured here;
+see the S1 (A) section. (At M = 20 the k = 100 crossover here is 150,
 against 250 in S1b: S1b's join read 8 blocks on its data and this one reads 6.
 A two-block change in the numerator moves the crossover by that much.)
 
@@ -616,8 +638,9 @@ q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
 | 100 | 100 | 1,100 | 125,936 | 7 / 784 | 3 | 4 | 0.91 |
 | 1000 | 1,000 | 10,239 | 1,169,968 | 7 / 784 | 3 | 4 | 0.10 |
 
-**How strongly it depends on N: in inverse proportion.** The embedded update
-costs about 10 to 12 reads and about 1,200 bytes of redo per embedded copy, so
+**How strongly it depends on N: about in inverse proportion.** The embedded update
+costs about 10 to 12 reads and about 1,170 to 1,390 bytes of redo per embedded copy (more per copy at
+smaller N), so
 its cost grows linearly with N, while the read advantage stays at one logical
 read (the customer index probe the embedded read skips) at every N. The
 crossover therefore falls as 1/N: about 8.5 tier changes per 1,000 order reads
@@ -629,7 +652,11 @@ direction: a crossover exists at every N.
 **Time.** CPU and elapsed medians come from 20 timed runs. For the S1b sweep
 they are from `m08_meter.measure_repeat` for the item readers at M = 100 and
 500; for the S2 sweep, from a loop of 20 embedded updates at N = 100 and 1,000,
-each committed after it is measured. At the meter's one-centisecond
+each committed after it is measured. Those loops also record
+`s2c-n{N}-embedded-update-timed-reads-median` for audit only: with a commit
+after every run its value moves widely between runs (8,840 and 11,521 at
+N = 1,000 in two validator runs), so the crossover uses the counted second
+execution, never this figure. At the meter's one-centisecond
 resolution the child table reads 0 cs everywhere, the order documents 2 cs at
 k = 100, M = 500 (1 to 2 cs) and 3 to 14 cs at k = 1,000, and the embedded update 0 cs at
 N = 100 and 3 cs at N = 1,000. Each timed copy runs the same plan as the

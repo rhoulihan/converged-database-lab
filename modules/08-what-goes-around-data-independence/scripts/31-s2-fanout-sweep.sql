@@ -20,7 +20,9 @@
 --   q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
 -- Redo is reported separately and is not in the crossover.
 --
--- No hints. Statistics carry a histogram on every indexed column (FOR ALL
+-- The embedded update and the embedded read carry no hints; the two
+-- normalized reads keep S2's index hints (one per plan, the cheaper counts),
+-- and the normalized update has none. Statistics carry a histogram on every indexed column (FOR ALL
 -- INDEXED COLUMNS SIZE 254), so the optimizer knows that customer 3 has 1,000
 -- orders and may pick a different plan for it. Each N has its own literal
 -- customer and order ids, so its own cursors. The executed plan of every
@@ -324,7 +326,7 @@ create or replace procedure m08c2_measure(p_n number, p_cust number) as
     m08_meter.record(pfx || '-embedded-update-elapsed-cs-max', mx(es));
     find_cursor(mk, sid, chn, phv);
     m08_meter.record('tmp:' || pfx || '-embedded-update-repeat-phv', phv);
-    -- Leave the customer row and its copies in step for the checks below.
+    -- The last timed run set SILVER; bring the customer row to the same tier.
     update m08c2_cust set tier = 'SILVER' where id = p_cust;
     commit;
   end;
