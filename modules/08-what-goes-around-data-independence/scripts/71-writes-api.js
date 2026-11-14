@@ -8,8 +8,9 @@
 // Two measuring windows around the 20 calls:
 //   1. v$sql: the growth of every cursor whose text names the target's objects
 //      (the API's generated SQL and, for the view, its per-row statements),
-//      shown per statement and summed: executions, buffer gets (logical reads)
-//      and CPU per call. Database side only: no API tier, no network.
+//      shown per statement, per statement class (METRIC) and summed:
+//      executions, buffer gets (logical reads) and CPU per call. The cursors
+//      are purged first. Database side only: no API tier, no network.
 //   2. v$mystat, read with $sql in the API's own database session (checked: the
 //      SID is the same before and after the 20 calls): logical reads, redo and
 //      CPU per call for the whole session, the snapshot query's own cost
@@ -80,7 +81,7 @@ const mystat = () => {
 };
 // Every cursor naming the target's objects, except this script's own queries.
 const cursors = (pat) => sql(`select sql_id, child_number c, executions e, buffer_gets g, cpu_time t,
-                                     substr(sql_text, 1, 160) txt
+                                     sql_text txt
                                 from v$sql
                                where upper(sql_text) like :1
                                  and upper(sql_text) not like '%V$SQL%'
@@ -89,12 +90,28 @@ const cursors = (pat) => sql(`select sql_id, child_number c, executions e, buffe
                                  and upper(sql_text) not like 'INSERT INTO M08D%'
                                  and upper(sql_text) not like 'DROP %'`, bind1(pat));
 const key = (x) => x.SQL_ID + '/' + x.C;
+// Purge the target's cursors first, so their counts start fresh (a cursor
+// reloaded after an earlier run's DROP would otherwise mis-count).
+const purge = (pat) => sql(`begin
+  for c in (select distinct address || ',' || hash_value n from v$sql
+             where upper(sql_text) like '${pat}' and upper(sql_text) not like '%V$SQL%') loop
+    begin sys.dbms_shared_pool.purge(c.n, 'C'); exception when others then null; end;
+  end loop;
+end;`);
+// Statement class, for one METRIC per kind of statement the API ran.
+const cls = (t) => /for update/i.test(t) ? 'select-for-update'
+  : /DRDUALV/.test(t) ? 'etag-select-dr'
+  : /DUALV/.test(t) ? 'etag-select'
+  : /^update "LAB_USER"\."M08D_API_LINE"/i.test(t) ? 'update-line'
+  : /^update/i.test(t) ? 'update-doc'
+  : 'other';
 const diff = (b, a, k) => Number(a[k]) - Number(b[k]);
 
 function measure(label, coll, pat) {
   const C = db.getCollection(coll);
   const results = [];
   const upd = (q) => C.updateOne({ _id: 1, 'lines.lineId': LINE }, { $set: { 'lines.$.qty': q } });
+  purge(pat);
   results.push(upd(500)); // warm-up
   // Empty window: the snapshot queries alone.
   const e0 = mystat();
@@ -112,6 +129,7 @@ function measure(label, coll, pat) {
   const before = {};
   for (const x of c0) before[key(x)] = x;
   let gets = 0, cpu = 0, stmts = 0;
+  const byCls = {};
   print('---- ' + label + ': statements that ran during the ' + RUNS + ' calls');
   for (const x of c1) {
     const b = before[key(x)] || { E: 0, G: 0, T: 0 };
@@ -120,9 +138,13 @@ function measure(label, coll, pat) {
     stmts += 1;
     gets += diff(b, x, 'G');
     cpu += diff(b, x, 'T');
+    const k = cls(String(x.TXT).trim());
+    byCls[k] = byCls[k] || { e: 0, g: 0 };
+    byCls[k].e += de;
+    byCls[k].g += diff(b, x, 'G');
     print('  ' + x.SQL_ID + ' child ' + x.C + ': execs/call ' + (de / RUNS) + ', gets/call ' +
           (diff(b, x, 'G') / RUNS).toFixed(1) + ', cpu-us/call ' + Math.round(diff(b, x, 'T') / RUNS) +
-          '\n     ' + String(x.TXT).replace(/\s+/g, ' '));
+          '\n     ' + String(x.TXT).replace(/\s+/g, ' ').slice(0, 200));
   }
   const ov = (k) => e1[k] - e0[k];
   const per = (k) => Math.max((m1[k] - m0[k]) - ov(k), 0) / RUNS;
@@ -130,6 +152,10 @@ function measure(label, coll, pat) {
         ', redo/call ' + per('redo size') + ', cpu-cs/call ' + per('CPU used by this session') +
         ' (snapshot overhead reads ' + ov('session logical reads') + ', redo ' + ov('redo size') + ')');
   print('METRIC:wr-api-' + label + '-statements:' + stmts);
+  for (const k of Object.keys(byCls).sort()) {
+    print('METRIC:wr-api-' + label + '-' + k + '-execs-per-call:' + (byCls[k].e / RUNS).toFixed(2));
+    print('METRIC:wr-api-' + label + '-' + k + '-gets-per-call:' + (byCls[k].g / RUNS).toFixed(1));
+  }
   print('METRIC:wr-api-' + label + '-vsql-gets-per-call:' + (gets / RUNS).toFixed(1));
   print('METRIC:wr-api-' + label + '-vsql-cpu-us-per-call:' + Math.round(cpu / RUNS));
   print('METRIC:wr-api-' + label + '-same-session:' + same);
@@ -138,7 +164,7 @@ function measure(label, coll, pat) {
     print('METRIC:wr-api-' + label + '-session-redo-per-call:' + Math.round(per('redo size')));
     print('METRIC:wr-api-' + label + '-session-cpu-cs-per-call:' + per('CPU used by this session').toFixed(2));
   }
-  return { results: results, stmts: stmts };
+  return { results: results, stmts: stmts, byCls: byCls };
 }
 
 // ===== Measure =====
@@ -167,7 +193,9 @@ print('check: col qty ' + c.qty + ', dv qty ' + v.qty + ', table ' + tab + ', sq
       ', lines ' + c.n + '/' + v.n + ', others unchanged ' + c.others + '/' + v.others);
 print('ASSERT:wr-api-one-doc-per-call:' + (allOne(col.results) && allOne(dv.results) ? 'PASS' : 'FAIL'));
 print('ASSERT:wr-api-change-visible:' + (visible ? 'PASS' : 'FAIL'));
-print('ASSERT:wr-api-statements-found:' + (col.stmts > 0 && dv.stmts > 0 ? 'PASS' : 'FAIL'));
+// The collection runs 2 statements (read for update, write); the view 5 (read
+// for update, two etag reads, the line update, the view update).
+print('ASSERT:wr-api-statements-found:' + (col.stmts === 2 && dv.stmts === 5 ? 'PASS' : 'FAIL'));
 
 // ===== Teardown =====
 for (const s of DROP) sql(s);

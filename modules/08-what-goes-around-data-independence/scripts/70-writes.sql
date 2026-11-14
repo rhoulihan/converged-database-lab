@@ -3,15 +3,22 @@
 --
 -- S1 to S4 measured reads and one kind of write (a customer field copied into
 -- many orders). This script measures the other writes:
---   1. insert an order with k lines (k = 10 and 100), three ways:
---        col : one document into a JSON collection table
---        dv  : one document through a duality view over orders + lines
---        sql : plain SQL, 1 order row plus k line rows (one FORALL)
+--   1. insert an order with k lines (k = 10 and 100), four ways:
+--        col    : one document into a JSON collection table
+--        dv     : one document through a duality view over orders + lines
+--        sql    : plain SQL, 1 order row plus k line rows (one FORALL array insert)
+--        sqlrow : plain SQL, 1 order row plus k single-row INSERTs in a loop
 --   2. knob 3 (Liu and Houlihan, The Elements of Data, forthcoming): change one
---      line's qty in a 1,000-line order, three ways:
---        col : JSON_TRANSFORM on the collection document (the line found by lineId)
---        dv  : the same JSON_TRANSFORM, through the duality view
---        sql : a one-row UPDATE on the lines table
+--      line's qty in a 1,000-line order:
+--        col    : JSON_TRANSFORM on the collection document, line found by lineId
+--        colpos : JSON_TRANSFORM by array position ($.lines[499]), same-length value
+--        colrep : the whole document replaced (the change made before the window),
+--                 which is what the MongoDB API sends (see 71-writes-api.js)
+--        dv     : the lineId JSON_TRANSFORM, through the duality view
+--        sql    : a one-row UPDATE on the lines table
+--      and SELECT ... FOR UPDATE of the order document (fu-col, fu-dv), the
+--      first statement the MongoDB API runs for an updateOne, with the number of
+--      undo records it creates (one per locked row).
 --   3. etags (S4 shape): rename a customer through a customer-centric view and
 --      count how many of its order documents (order-centric view, nested
 --      read-only customer) get a new _metadata.etag; then write one order with
@@ -29,17 +36,20 @@
 -- a window that closed before the COMMIT would show 0 redo for some writes. One
 -- warm-up run is not counted, then 20 counted runs; the median is the lower
 -- middle value of the 20 (an observed run), as in the meter. The meter's own
--- overhead (snap then delta, no work) is subtracted from reads and redo. Reads
--- use m08_meter.measure_repeat (20 runs).
+-- overhead (snap then delta, no work) is subtracted from reads and redo. Samples
+-- are kept in memory during a loop and stored after it, so no window carries
+-- another write. Reads use m08_meter.measure_repeat (20 runs).
 -- Every measured statement carries gather_plan_statistics and a marker last in
 -- its hint comment; its executed plan (ALLSTATS LAST) is printed as PLAN rows.
 -- Session statistics include recursive SQL: the duality view's per-row writes
--- and etag checks, and the materialized view's refresh, are all counted.
+-- and etag checks, and the materialized view's refresh, are all counted. Those
+-- recursive statements are also listed from v$sql (growth over one loop, per
+-- statement: executions, rows, buffer gets and text) as METRIC and PLAN rows.
 --
 -- No ASSERT compares costs. The ASSERTs check correctness only: the same
--- content from all three insert paths, the one-line change visible in every
--- read, the etag check working at all (controls), the MV matching the tables
--- after COMMIT, and plans captured.
+-- content from all four insert paths, the one-line change visible in every
+-- read, the etag check working at all (controls), the MV refreshed by FAST
+-- refresh at every COMMIT, and plans captured.
 --
 -- Commits: this script commits its own M08D_ test data (the tier change must
 -- commit to fire the refresh). It drops everything it creates.
@@ -47,6 +57,7 @@
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08d_measure_mv;
 drop procedure if exists m08d_measure;
+drop package if exists m08d_h;
 drop materialized view if exists m08d_ord_cust_mv;
 drop view if exists m08d_s4ord_dv;
 drop view if exists m08d_s4cust_dv;
@@ -63,12 +74,16 @@ drop table if exists m08d_emb purge;
 drop table if exists m08d_cust purge;
 drop table if exists m08d_samp purge;
 drop table if exists m08d_plan purge;
+drop table if exists m08d_vs purge;
+drop table if exists m08d_oson purge;
 delete from m08_metrics where name like 'wr-%' or name like 'tmp:wr-%';
 
--- Scratch: one row per counted run, and the executed plans.
+-- Scratch: one row per counted run, the executed plans, and v$sql snapshots.
 create table m08d_samp (stmt varchar2(40), run number, reads number, redo number,
                         cpu number, ela number);
 create table m08d_plan (stmt varchar2(40), ln number, line varchar2(400));
+create table m08d_vs (label varchar2(40), phase number, sql_id varchar2(13), child number,
+                      execs number, rws number, gets number, txt varchar2(400));
 
 -- ===== Parts 1 and 2: orders with lines, three projections =====
 -- The relational projection: orders and lines. Lines are keyed by lineId, a
@@ -263,27 +278,61 @@ begin
 end;
 /
 
--- Size of the knob-3 document, and whether its body is stored out of row.
+-- The knob-3 document: its JSON text size, its stored (OSON) size, and whether
+-- its body is stored out of the row. The OSON bytes are taken by serializing
+-- the JSON value in PL/SQL into a BLOB column that only accepts OSON (the check
+-- constraint proves the format). The column's in-row part (vsize) is a LOB
+-- locator when the body is out of row.
+create table m08d_oson (b blob check (b is json format oson));
+
+declare
+  j  json;
+  ob number;
+  ib number;
+begin
+  select d.data, vsize(d.data) into j, ib from m08d_doc d where d.data."_id" = 1;
+  insert into m08d_oson values (json_serialize(j returning blob));
+  select dbms_lob.getlength(b) into ob from m08d_oson;
+  m08_meter.record('wr-k3-doc-oson-bytes', ob);
+  m08_meter.record('wr-k3-doc-inrow-bytes', ib);
+  m08_meter.record('wr-k3-doc-out-of-row', case when ib < ob then 1 else 0 end);
+  commit;
+end;
+/
+
 insert into m08_metrics (name, value)
-  select 'wr-k3-doc-bytes', dbms_lob.getlength(json_serialize(d.data returning blob))
+  select 'wr-k3-doc-text-bytes', dbms_lob.getlength(json_serialize(d.data returning blob))
     from m08d_doc d where d.data."_id" = 1;
 
--- ===== Parts 1 to 3 =====
-create or replace procedure m08d_measure as
-  ovr number;
-  ovd number;
-  ok  number;
-  n   number;
-  v1  number;
-  v2  number;
-  v3  number;
-  j   json;
-  type t_num is table of number;
-  type t_vc  is table of varchar2(20);
-  ids  t_num;
-  skus t_vc;
-  qtys t_num;
-  e    clob;
+-- ===== Shared measuring helpers =====
+create or replace package m08d_h as
+  -- The meter overhead recorded above (reads, redo).
+  function ovr return number;
+  function ovd return number;
+  function v(p_name varchar2) return number;
+  -- Close one counted window (run > 0) and keep it in memory.
+  procedure sample(p_stmt varchar2, p_run number);
+  -- Store the kept samples, then record wr-<stmt>-<stat>-median/-max.
+  procedure summarize(p_stmt varchar2);
+  -- Executed plan of the newest valid cursor carrying the marker.
+  procedure capture(p_stmt varchar2, p_marker varchar2);
+  -- v$sql growth of the statements whose upper-case text matches a regular
+  -- expression: vs_snap purges their cursors (so the counts start fresh; a
+  -- cursor reloaded after an earlier run's DROP would otherwise mis-count) and
+  -- takes a snapshot before a loop; vs_done records the growth per statement
+  -- class, per call, and one PLAN row per statement.
+  procedure vs_snap(p_label varchar2, p_pattern varchar2);
+  procedure vs_done(p_label varchar2, p_calls number);
+end m08d_h;
+/
+
+create or replace package body m08d_h as
+  type t_s is record (stmt varchar2(40), run number, reads number, redo number,
+                      cpu number, ela number);
+  type t_ss is table of t_s;
+  g_buf t_ss := t_ss();
+  type t_pat is table of varchar2(200) index by varchar2(40);
+  g_pat t_pat;
 
   function v(p_name varchar2) return number is
     x number;
@@ -292,7 +341,9 @@ create or replace procedure m08d_measure as
     return x;
   end;
 
-  -- Close one counted window and store it.
+  function ovr return number is begin return v('wr-meter-overhead-reads'); end;
+  function ovd return number is begin return v('wr-meter-overhead-redo'); end;
+
   procedure sample(p_stmt varchar2, p_run number) is
     r  number := m08_meter.delta('session logical reads');
     d  number := m08_meter.delta('redo size');
@@ -300,13 +351,20 @@ create or replace procedure m08d_measure as
     el number := m08_meter.elapsed_cs;
   begin
     if p_run > 0 then
-      insert into m08d_samp values (p_stmt, p_run, greatest(r - ovr, 0), greatest(d - ovd, 0), c, el);
+      g_buf.extend;
+      g_buf(g_buf.count) := t_s(p_stmt, p_run, r, d, c, el);
     end if;
   end;
 
-  -- Medians and maxima of the 20 counted runs, as wr-<stmt>-<stat>-median/-max.
   procedure summarize(p_stmt varchar2) is
+    o_r number := ovr;
+    o_d number := ovd;
   begin
+    for i in 1 .. g_buf.count loop
+      insert into m08d_samp values (g_buf(i).stmt, g_buf(i).run, greatest(g_buf(i).reads - o_r, 0),
+                                    greatest(g_buf(i).redo - o_d, 0), g_buf(i).cpu, g_buf(i).ela);
+    end loop;
+    g_buf.delete;
     for s in (select percentile_disc(0.5) within group (order by reads) rm, max(reads) rx,
                      percentile_disc(0.5) within group (order by redo) dm, max(redo) dx,
                      percentile_disc(0.5) within group (order by cpu) cm, max(cpu) cx,
@@ -323,7 +381,6 @@ create or replace procedure m08d_measure as
     end loop;
   end;
 
-  -- Executed plan of the newest valid cursor carrying the marker.
   procedure capture(p_stmt varchar2, p_marker varchar2) is
     sid varchar2(13);
     chn number;
@@ -349,8 +406,106 @@ create or replace procedure m08d_measure as
       m08_meter.record('tmp:wr-' || p_stmt || '-xplan-buffers', 0);
   end;
 
+  procedure vs_take(p_label varchar2, p_phase number) is
+  begin
+    insert into m08d_vs (label, phase, sql_id, child, execs, rws, gets, txt)
+      select p_label, p_phase, sql_id, child_number, executions, rows_processed, buffer_gets,
+             substr(sql_text, 1, 400)
+        from v$sql
+       where regexp_like(upper(sql_text), g_pat(p_label))
+         and upper(sql_text) not like '%V$SQL%';
+  end;
+
+  procedure vs_snap(p_label varchar2, p_pattern varchar2) is
+  begin
+    g_pat(p_label) := p_pattern;
+    for c in (select distinct address || ',' || hash_value n from v$sql
+               where regexp_like(upper(sql_text), p_pattern)
+                 and upper(sql_text) not like '%V$SQL%') loop
+      begin
+        sys.dbms_shared_pool.purge(c.n, 'C');
+      exception
+        when others then null;
+      end;
+    end loop;
+    vs_take(p_label, 0);
+  end;
+
+  -- Statement class: refresh-del / refresh-ins for the MV refresh, otherwise
+  -- the first word and the table, e.g. insert-line, update-line, insert-mlog-cust.
+  procedure vs_done(p_label varchar2, p_calls number) is
+    n number := 0;
+  begin
+    vs_take(p_label, 1);
+    for c in (select cls, sum(de) de, sum(dr) dr, sum(dg) dg
+                from (select case
+                               when a.txt like '/* MV_REFRESH (DEL)%' then 'refresh-del'
+                               when a.txt like '/* MV_REFRESH (INS)%' then 'refresh-ins'
+                               else nvl(lower(regexp_substr(ltrim(a.txt), '^[A-Za-z]+')), 'other')
+                                    || '-' || replace(regexp_replace(regexp_replace(
+                                         lower(replace(regexp_substr(upper(a.txt),
+                                           '"(MLOG\$_)?M08D_[A-Z0-9_]+"'), '"')),
+                                         '^mlog\$_m08d_', 'mlog-'), '^m08d_', ''), '_', '-')
+                             end cls,
+                             a.execs - nvl(b.execs, 0) de, a.rws - nvl(b.rws, 0) dr,
+                             a.gets - nvl(b.gets, 0) dg
+                        from m08d_vs a
+                        left join m08d_vs b
+                          on b.label = a.label and b.phase = 0 and b.sql_id = a.sql_id
+                         and b.child = a.child
+                       where a.label = p_label and a.phase = 1
+                         and a.execs - nvl(b.execs, 0) > 0)
+               group by cls) loop
+      n := n + 1;
+      m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-execs-per-call',
+                       round(c.de / p_calls, 2));
+      m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-rows-per-call',
+                       round(c.dr / p_calls, 2));
+      m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-gets-per-call',
+                       round(c.dg / p_calls, 2));
+    end loop;
+    -- One PLAN row per statement: growth per call and the text.
+    insert into m08d_plan (stmt, ln, line)
+      select 'vsql-' || p_label, rownum,
+             substr('per call: execs ' || round(de / p_calls, 2) || ', rows ' || round(dr / p_calls, 2)
+                    || ', gets ' || round(dg / p_calls, 2) || ' | ' || regexp_replace(txt, '\s+', ' '),
+                    1, 400)
+        from (select min(a.txt) txt, sum(a.execs - nvl(b.execs, 0)) de,
+                     sum(a.rws - nvl(b.rws, 0)) dr, sum(a.gets - nvl(b.gets, 0)) dg
+                from m08d_vs a
+                left join m08d_vs b
+                  on b.label = a.label and b.phase = 0 and b.sql_id = a.sql_id and b.child = a.child
+               where a.label = p_label and a.phase = 1 and a.execs - nvl(b.execs, 0) > 0
+               group by a.sql_id
+               order by 4 desc);
+    m08_meter.record('tmp:wr-vs-' || p_label || '-classes', n);
+  end;
+end m08d_h;
+/
+
+-- ===== Parts 1 to 3 =====
+create or replace procedure m08d_measure as
+  ok   number;
+  n    number;
+  v1   number;
+  v2   number;
+  v3   number;
+  urec number;
+  j    json;
+  e    clob;
+  type t_num  is table of number;
+  type t_vc   is table of varchar2(20);
+  type t_base is table of number index by varchar2(20);
+  ids   t_num;
+  skus  t_vc;
+  qtys  t_num;
+  bases t_base;
+  -- Order ids are handed out in call order, so every insert into the orders
+  -- and lines tables (dv, sql, sqlrow) lands at the right edge of its indexes.
+  next_id number := 100000;
+
   -- The document for order p_id with k lines; its content depends only on
-  -- (k, total), never on the id, so the three paths can be compared.
+  -- (k, total), never on the id, so the paths can be compared.
   function build_doc(p_id number, p_k number, p_total number) return json is
     x json;
   begin
@@ -367,7 +522,7 @@ create or replace procedure m08d_measure as
     return x;
   end;
 
-  -- Content signature, id-free: custId|status|total|lines|lineNo:sku:qty,...
+  -- Content signature, without ids: custId|status|total|lines|lineNo:sku:qty,...
   function sig_doc(p_src varchar2, p_id number) return varchar2 is
     s varchar2(4000);
   begin
@@ -398,7 +553,7 @@ create or replace procedure m08d_measure as
     return s;
   end;
 
-  -- qty of one line, read four ways.
+  -- qty of one line of order 1, read three ways.
   function qty_col(p_line number) return number is
     x number;
   begin
@@ -426,10 +581,11 @@ create or replace procedure m08d_measure as
 
   -- One insert path, one k: 1 warm-up and 20 counted runs, each with its commit.
   procedure insert_path(p_path varchar2, p_k number) is
-    base number := case p_path when 'col' then 100000 when 'dv' then 200000 else 300000 end
-                   + p_k * 100;
+    base number := next_id;
     id   number;
   begin
+    bases(p_path || p_k) := base;
+    next_id := next_id + 21;
     for r in 0 .. 20 loop
       id := base + r;
       -- Everything the statement needs is built before the window opens.
@@ -445,28 +601,49 @@ create or replace procedure m08d_measure as
         insert /*+ gather_plan_statistics M08DXIC */ into m08d_doc (data) values (j);
       elsif p_path = 'dv' then
         insert /*+ gather_plan_statistics M08DXID */ into m08d_ord_dv (data) values (j);
-      else
+      elsif p_path = 'sql' then
         insert /*+ gather_plan_statistics M08DXIO */ into m08d_ord (ord_id, cust_id, status, total)
           values (id, 7, 'NEW', p_k * 10 + r);
         forall i in 1 .. ids.count
           insert /*+ gather_plan_statistics M08DXIL */ into m08d_line (line_id, ord_id, sku, qty)
             values (ids(i), id, skus(i), qtys(i));
+      else
+        insert /*+ gather_plan_statistics M08DXIRO */ into m08d_ord (ord_id, cust_id, status, total)
+          values (id, 7, 'NEW', p_k * 10 + r);
+        for i in 1 .. ids.count loop
+          insert /*+ gather_plan_statistics M08DXIRL */ into m08d_line (line_id, ord_id, sku, qty)
+            values (ids(i), id, skus(i), qtys(i));
+        end loop;
       end if;
       commit;
-      sample('ins-' || p_path || '-k' || p_k, r);
+      m08d_h.sample('ins-' || p_path || '-k' || p_k, r);
     end loop;
-    summarize('ins-' || p_path || '-k' || p_k);
+    m08d_h.summarize('ins-' || p_path || '-k' || p_k);
   end;
 
-  -- Knob 3: change line 1500's qty in order 1 (1,000 lines). Run r sets qty
-  -- 100 + r for col, 200 + r for dv, 300 + r for sql, so every run changes it.
+  -- Knob 3: change line 1500's qty in order 1 (1,000 lines). Every run writes a
+  -- new 3-digit value (col 100 + r, colpos 400 + r, colrep 500 + r, dv 200 + r,
+  -- sql 300 + r), so every run is a real change of the same length.
   procedure knob3(p_path varchar2) is
   begin
     for r in 0 .. 20 loop
+      if p_path = 'colrep' then
+        -- The whole new document, built before the window opens.
+        select json_transform(d.data, set '$.lines[499].qty' = 500 + r) into j
+          from m08d_doc d where d.data."_id" = 1;
+      end if;
       m08_meter.snap;
       if p_path = 'col' then
         update /*+ gather_plan_statistics M08DXK3C */ m08d_doc d
            set d.data = json_transform(d.data, set '$.lines[*]?(@.lineId == 1500).qty' = 100 + r)
+         where d.data."_id" = 1;
+      elsif p_path = 'colpos' then
+        update /*+ gather_plan_statistics M08DXK3P */ m08d_doc d
+           set d.data = json_transform(d.data, set '$.lines[499].qty' = 400 + r)
+         where d.data."_id" = 1;
+      elsif p_path = 'colrep' then
+        update /*+ gather_plan_statistics M08DXK3R */ m08d_doc d
+           set d.data = j
          where d.data."_id" = 1;
       elsif p_path = 'dv' then
         update /*+ gather_plan_statistics M08DXK3V */ m08d_ord_dv d
@@ -479,36 +656,66 @@ create or replace procedure m08d_measure as
       end if;
       n := sql%rowcount;
       commit;
-      sample('k3-' || p_path, r);
+      m08d_h.sample('k3-' || p_path, r);
     end loop;
     m08_meter.record('wr-k3-' || p_path || '-rows', n);
-    summarize('k3-' || p_path);
+    m08d_h.summarize('k3-' || p_path);
+  end;
+
+  -- SELECT ... FOR UPDATE of order 1's document, then COMMIT. Before the
+  -- COMMIT, the transaction's undo records are read: one per locked row.
+  procedure for_update(p_what varchar2) is
+  begin
+    for r in 0 .. 20 loop
+      m08_meter.snap;
+      if p_what = 'col' then
+        select /*+ gather_plan_statistics M08DXFUC */ d.data into j
+          from m08d_doc d where d.data."_id" = 1 for update;
+      else
+        select /*+ gather_plan_statistics M08DXFUV */ d.data into j
+          from m08d_ord_dv d where d.data."_id" = 1 for update;
+      end if;
+      begin
+        select t.used_urec into urec
+          from v$transaction t join v$session s on s.taddr = t.addr
+         where s.sid = sys_context('userenv', 'sid');
+      exception
+        when no_data_found then urec := 0;
+      end;
+      commit;
+      m08d_h.sample('fu-' || p_what, r);
+    end loop;
+    m08_meter.record('wr-fu-' || p_what || '-undo-records', urec);
+    m08d_h.summarize('fu-' || p_what);
   end;
 
 begin
-  ovr := v('wr-meter-overhead-reads');
-  ovd := v('wr-meter-overhead-redo');
-
   -- ----- Part 1: inserts -----
   for k in (select 10 k from dual union all select 100 from dual) loop
     insert_path('col', k.k);
+    m08d_h.vs_snap('ins-dv-k' || k.k, '"LAB_USER"\."M08D_');
     insert_path('dv', k.k);
+    m08d_h.vs_done('ins-dv-k' || k.k, 21);
     insert_path('sql', k.k);
+    insert_path('sqlrow', k.k);
   end loop;
-  capture('ins-col', 'M08DXIC');
-  capture('ins-dv', 'M08DXID');
-  capture('ins-sql-ord', 'M08DXIO');
-  capture('ins-sql-line', 'M08DXIL');
+  m08d_h.capture('ins-col', 'M08DXIC');
+  m08d_h.capture('ins-dv', 'M08DXID');
+  m08d_h.capture('ins-sql-ord', 'M08DXIO');
+  m08d_h.capture('ins-sql-line', 'M08DXIL');
+  m08d_h.capture('ins-sqlrow-ord', 'M08DXIRO');
+  m08d_h.capture('ins-sqlrow-line', 'M08DXIRL');
 
-  -- Same content: for every (k, run), the three paths hold the same order,
-  -- read back as the collection document, the duality-view document and the
-  -- table rows. The k-line count is part of the signature.
+  -- Same content: for every (k, run), the four paths hold the same order, read
+  -- back as the collection document, the duality-view document and table rows.
+  -- The k-line count is part of the signature.
   ok := 0;
   for k in (select 10 k from dual union all select 100 from dual) loop
     for r in 0 .. 20 loop
-      if sig_doc('m08d_doc', 100000 + k.k * 100 + r) = sig_doc('m08d_ord_dv', 200000 + k.k * 100 + r)
-         and sig_doc('m08d_ord_dv', 200000 + k.k * 100 + r) = sig_sql(300000 + k.k * 100 + r)
-         and sig_sql(300000 + k.k * 100 + r) like '7|NEW|' || (k.k * 10 + r) || '|' || k.k || '|%' then
+      if sig_doc('m08d_doc', bases('col' || k.k) + r) = sig_doc('m08d_ord_dv', bases('dv' || k.k) + r)
+         and sig_doc('m08d_ord_dv', bases('dv' || k.k) + r) = sig_sql(bases('sql' || k.k) + r)
+         and sig_sql(bases('sql' || k.k) + r) = sig_sql(bases('sqlrow' || k.k) + r)
+         and sig_sql(bases('sql' || k.k) + r) like '7|NEW|' || (k.k * 10 + r) || '|' || k.k || '|%' then
         ok := ok + 1;
       end if;
     end loop;
@@ -516,15 +723,29 @@ begin
   m08_meter.record('tmp:wr-ins-same-content', ok);
 
   -- ----- Part 2: knob 3 -----
+  -- The positional arm needs line 1500 at position 499.
+  select count(*) into n from m08d_doc d
+   where d.data."_id" = 1 and json_value(d.data, '$.lines[499].lineId' returning number) = 1500;
+  m08_meter.record('tmp:wr-k3-pos-is-1500', n);
   v1 := qty_tab(1499);
   knob3('col');
+  knob3('colpos');
+  knob3('colrep');
+  m08d_h.vs_snap('k3-dv', '"LAB_USER"\."M08D_');
   knob3('dv');
-  -- After the duality-view update, the change is in the line row, and only there.
+  m08d_h.vs_done('k3-dv', 21);
+  -- After the duality-view update, the change is in the line row.
   m08_meter.record('tmp:wr-k3-dv-in-table', case when qty_tab(1500) = 220 then 1 else 0 end);
   knob3('sql');
-  capture('k3-col', 'M08DXK3C');
-  capture('k3-dv', 'M08DXK3V');
-  capture('k3-sql', 'M08DXK3S');
+  for_update('col');
+  for_update('dv');
+  m08d_h.capture('k3-col', 'M08DXK3C');
+  m08d_h.capture('k3-colpos', 'M08DXK3P');
+  m08d_h.capture('k3-colrep', 'M08DXK3R');
+  m08d_h.capture('k3-dv', 'M08DXK3V');
+  m08d_h.capture('k3-sql', 'M08DXK3S');
+  m08d_h.capture('fu-col', 'M08DXFUC');
+  m08d_h.capture('fu-dv', 'M08DXFUV');
   -- Every read shows its last change; the neighbouring line is untouched; the
   -- documents still have 1,000 lines.
   select count(*) into n from m08d_doc d, json_table(d.data, '$.lines[*]' columns (x number path '$.lineId')) jt
@@ -532,7 +753,7 @@ begin
   select count(*) into v2 from m08d_ord_dv d, json_table(d.data, '$.lines[*]' columns (x number path '$.lineId')) jt
    where d.data."_id" = 1;
   m08_meter.record('tmp:wr-k3-visible',
-                   case when qty_col(1500) = 120 and qty_dv(1500) = 320 and qty_tab(1500) = 320
+                   case when qty_col(1500) = 520 and qty_dv(1500) = 320 and qty_tab(1500) = 320
                          and qty_col(1499) = v1 and qty_dv(1499) = v1 and qty_tab(1499) = v1
                          and n = 1000 and v2 = 1000
                         then 1 else 0 end);
@@ -543,15 +764,18 @@ begin
     select d.data."_id".number(), json_value(d.data, '$._metadata.etag'),
            json_serialize(d.data returning clob)
       from m08d_s4ord_dv d;
-  -- The one rename, through the customer-centric view, measured.
+  commit;
+  -- The one rename, through the customer-centric view, measured with its commit.
   m08_meter.snap;
   update m08d_s4cust_dv d
      set d.data = json_transform(d.data, set '$.name' = 'Renamed Customer')
    where d.data."_id" = 1;
   n := sql%rowcount;
   commit;
-  m08_meter.record('wr-s4d-rename-reads', greatest(m08_meter.delta('session logical reads') - ovr, 0));
-  m08_meter.record('wr-s4d-rename-redo', greatest(m08_meter.delta('redo size') - ovd, 0));
+  v1 := m08_meter.delta('session logical reads');
+  v2 := m08_meter.delta('redo size');
+  m08_meter.record('wr-s4d-rename-reads', greatest(v1 - m08d_h.ovr, 0));
+  m08_meter.record('wr-s4d-rename-redo', greatest(v2 - m08d_h.ovd, 0));
   m08_meter.record('wr-s4d-rename-docs', n);
   -- Re-read: how many of customer 1's 5 order documents have a new etag, and
   -- how many of customer 2's 3 (not renamed).
@@ -623,78 +847,21 @@ end;
 -- Phase 2: MV logs and the MV, then the MV read and the tier change through it.
 -- The normalized tier change is measured first so it pays no MV log cost.
 create or replace procedure m08d_measure_mv(p_phase number) as
-  ovr number;
-  ovd number;
-  n   number;
-  t   varchar2(10);
-
-  function v(p_name varchar2) return number is
-    x number;
-  begin
-    select value into x from m08_metrics where name = p_name;
-    return x;
-  end;
-
-  procedure sample(p_stmt varchar2, p_run number) is
-    r  number := m08_meter.delta('session logical reads');
-    d  number := m08_meter.delta('redo size');
-    c  number := m08_meter.delta('CPU used by this session');
-    el number := m08_meter.elapsed_cs;
-  begin
-    if p_run > 0 then
-      insert into m08d_samp values (p_stmt, p_run, greatest(r - ovr, 0), greatest(d - ovd, 0), c, el);
-    end if;
-  end;
-
-  procedure summarize(p_stmt varchar2) is
-  begin
-    for s in (select percentile_disc(0.5) within group (order by reads) rm, max(reads) rx,
-                     percentile_disc(0.5) within group (order by redo) dm, max(redo) dx,
-                     percentile_disc(0.5) within group (order by cpu) cm, max(cpu) cx,
-                     percentile_disc(0.5) within group (order by ela) em, count(*) cnt
-                from m08d_samp where stmt = p_stmt) loop
-      m08_meter.record('wr-' || p_stmt || '-reads-median', s.rm);
-      m08_meter.record('wr-' || p_stmt || '-reads-max', s.rx);
-      m08_meter.record('wr-' || p_stmt || '-redo-median', s.dm);
-      m08_meter.record('wr-' || p_stmt || '-redo-max', s.dx);
-      m08_meter.record('wr-' || p_stmt || '-cpu-cs-median', s.cm);
-      m08_meter.record('wr-' || p_stmt || '-cpu-cs-max', s.cx);
-      m08_meter.record('wr-' || p_stmt || '-elapsed-cs-median', s.em);
-      m08_meter.record('tmp:wr-' || p_stmt || '-runs', s.cnt);
-    end loop;
-  end;
-
-  procedure capture(p_stmt varchar2, p_marker varchar2) is
-    sid varchar2(13);
-    chn number;
-    nb  number;
-  begin
-    select sql_id, child_number into sid, chn
-      from (select sql_id, child_number from v$sql
-             where upper(sql_text) like '% ' || p_marker || ' */%'
-               and upper(sql_text) not like '%V$SQL%' and object_status = 'VALID'
-             order by last_active_time desc, child_number desc)
-     where rownum = 1;
-    insert into m08d_plan (stmt, ln, line)
-      select p_stmt, rownum, substr(plan_table_output, 1, 400)
-        from table(dbms_xplan.display_cursor(sid, chn, 'ALLSTATS LAST'));
-    select count(*) into nb from m08d_plan where stmt = p_stmt and line like '%Buffers%';
-    m08_meter.record('tmp:wr-' || p_stmt || '-xplan-buffers', nb);
-    select count(case when operation = 'TABLE ACCESS' and options like '%FULL%'
-                       and object_name like 'M08D%' then 1 end)
-      into nb from v$sql_plan where sql_id = sid and child_number = chn;
-    m08_meter.record('tmp:wr-' || p_stmt || '-full-scans', nb);
-  exception
-    when no_data_found then
-      m08_meter.record('tmp:wr-' || p_stmt || '-xplan-buffers', 0);
-  end;
+  n    number;
+  cnt  number;
+  nref number := 0;
+  t    varchar2(10);
 
   -- One tier change on customer 1 plus COMMIT, 1 warm-up and 20 counted runs.
-  -- The tiers alternate, so every run is a real change.
-  procedure tier_change(p_stmt varchar2) is
+  -- The tiers alternate, so every run is a real change. Phase 1 starts from
+  -- BRONZE and ends on SILVER; phase 2 (offset 1) starts with GOLD, so its
+  -- first run already differs from the MV's starting content, and ends on GOLD.
+  -- In phase 2, after every COMMIT, the MV must show the new tier on all 100
+  -- of customer 1's rows.
+  procedure tier_change(p_stmt varchar2, p_off number) is
   begin
     for r in 0 .. 20 loop
-      t := case mod(r, 2) when 0 then 'SILVER' else 'GOLD' end;
+      t := case mod(r + p_off, 2) when 0 then 'SILVER' else 'GOLD' end;
       m08_meter.snap;
       if p_stmt = 'mv-upd-embedded' then
         update /*+ gather_plan_statistics M08DXMUE */ m08d_emb d
@@ -709,14 +876,17 @@ create or replace procedure m08d_measure_mv(p_phase number) as
       end if;
       n := sql%rowcount;
       commit;
-      sample(p_stmt, r);
+      m08d_h.sample(p_stmt, r);
+      if p_stmt = 'mv-upd-mv' then
+        execute immediate 'select count(*) from m08d_ord_cust_mv where cust_id = 1 and tier = :1'
+          into cnt using t;
+        if cnt = 100 then nref := nref + 1; end if;
+      end if;
     end loop;
     m08_meter.record('wr-' || p_stmt || '-rows', n);
-    summarize(p_stmt);
+    m08d_h.summarize(p_stmt);
   end;
 begin
-  ovr := v('wr-meter-overhead-reads');
-  ovd := v('wr-meter-overhead-redo');
   if p_phase = 1 then
     m08_meter.measure_repeat('wr-mv-read-embedded',
       'select /*+ gather_plan_statistics M08DXMRE */ json_serialize(d.data returning blob)'
@@ -725,19 +895,22 @@ begin
       'select /*+ gather_plan_statistics index(o m08d_cord_pk) index(c m08d_cust_pk) M08DXMRN */'
       || ' o.id, o.status, o.total, c.id, c.name, c.tier'
       || ' from m08d_cord o join m08d_cust c on c.id = o.cust_id where o.id = 201', 20);
-    capture('mv-read-embedded', 'M08DXMRE');
-    capture('mv-read-normalized', 'M08DXMRN');
-    tier_change('mv-upd-embedded');
-    capture('mv-upd-embedded', 'M08DXMUE');
-    tier_change('mv-upd-normalized');
-    capture('mv-upd-normalized', 'M08DXMU');
+    m08d_h.capture('mv-read-embedded', 'M08DXMRE');
+    m08d_h.capture('mv-read-normalized', 'M08DXMRN');
+    tier_change('mv-upd-embedded', 0);
+    m08d_h.capture('mv-upd-embedded', 'M08DXMUE');
+    tier_change('mv-upd-normalized', 0);
+    m08d_h.capture('mv-upd-normalized', 'M08DXMU');
   else
     m08_meter.measure_repeat('wr-mv-read-mv',
       'select /*+ gather_plan_statistics M08DXMRM */ m.id, m.status, m.total, m.cust_id, m.name, m.tier'
       || ' from m08d_ord_cust_mv m where m.id = 201', 20);
-    capture('mv-read-mv', 'M08DXMRM');
-    tier_change('mv-upd-mv');
-    capture('mv-upd-mv', 'M08DXMU');
+    m08d_h.capture('mv-read-mv', 'M08DXMRM');
+    m08d_h.vs_snap('mv-refresh', '"(M08D_ORD_CUST_MV|MLOG\$_M08D_[A-Z_]+)"');
+    tier_change('mv-upd-mv', 1);
+    m08d_h.vs_done('mv-refresh', 21);
+    m08_meter.record('tmp:wr-mv-refreshed-runs', nref);
+    m08d_h.capture('mv-upd-mv', 'M08DXMU');
   end if;
 end;
 /
@@ -778,34 +951,37 @@ begin
 end;
 /
 
+-- The MV starts with customer 1 at SILVER (phase 1's last change).
 insert into m08_metrics (name, value)
-  select 'tmp:wr-mv-mode-ok', case when refresh_mode = 'COMMIT' then 1 else 0 end
-    from user_mviews where mview_name = 'M08D_ORD_CUST_MV';
+  select 'tmp:wr-mv-start-silver', count(*)
+    from m08d_ord_cust_mv where cust_id = 1 and tier = 'SILVER';
 
 begin
   m08d_measure_mv(2);
 end;
 /
 
--- After the last committed tier change: the MV matches the tables for every
--- one of customer 1's orders, and the order read gives the same row from the
--- MV and from the join.
+-- How the MV was refreshed, as the dictionary reports it after phase 2.
+insert into m08_metrics (name, value)
+  select 'tmp:wr-mv-mode-ok', case when refresh_mode = 'COMMIT' then 1 else 0 end
+    from user_mviews where mview_name = 'M08D_ORD_CUST_MV';
+
+insert into m08_metrics (name, value)
+  select 'tmp:wr-mv-last-refresh-fast', case when last_refresh_type = 'FAST' then 1 else 0 end
+    from user_mviews where mview_name = 'M08D_ORD_CUST_MV';
+
+-- After the last committed tier change (GOLD, not the MV's starting SILVER):
+-- the MV matches the tables for every one of customer 1's orders.
 declare
   ok number;
-  et varchar2(10);
 begin
-  select json_value(d.data, '$.customer.tier') into et from m08d_emb d where d.data."_id" = 201;
   select case when count(*) = 100
-               and count(case when m.tier = c.tier and m.name = c.name and m.status = o.status
-                               and m.total = o.total then 1 end) = 100
+               and count(case when m.tier = 'GOLD' and m.tier = c.tier and m.name = c.name
+                               and m.status = o.status and m.total = o.total then 1 end) = 100
               then 1 else 0 end
     into ok
     from m08d_ord_cust_mv m join m08d_cord o on o.id = m.id join m08d_cust c on c.id = o.cust_id
    where c.id = 1;
-  select case when ok = 1 and count(*) = 1 then 1 else 0 end into ok
-    from m08d_ord_cust_mv m join m08d_cord o on o.id = m.id join m08d_cust c on c.id = o.cust_id
-   where m.id = 201 and m.tier = c.tier and m.name = c.name and m.status = o.status
-     and m.total = o.total and m.tier = et;
   m08_meter.record('tmp:wr-mv-reflects', ok);
 end;
 /
@@ -818,30 +994,44 @@ select 'METRIC:' || name || ':' ||
  where name like 'wr-%'
  order by name;
 
+select 'METRIC:wr-mv-refresh-method:' || refresh_method from user_mviews
+ where mview_name = 'M08D_ORD_CUST_MV'
+union all
+select 'METRIC:wr-mv-last-refresh-type:' || last_refresh_type from user_mviews
+ where mview_name = 'M08D_ORD_CUST_MV'
+union all
+select 'METRIC:wr-mv-staleness:' || staleness from user_mviews
+ where mview_name = 'M08D_ORD_CUST_MV';
+
 select 'PLAN:' || stmt || ': ' || line
   from m08d_plan
  order by stmt, ln;
 
 -- ===== Assertions (read back from m08_metrics) =====
 
--- The three insert paths store the same order, for k = 10 and 100, all 21 runs each.
+-- The four insert paths store the same order, for k = 10 and 100, all 21 runs each.
 select 'ASSERT:wr-insert-same-content:' ||
        case when (select value from m08_metrics where name = 'tmp:wr-ins-same-content') = 42
              and (select count(*) from m08_metrics
-                   where name like 'tmp:wr-ins-%-runs' and value = 20) = 6
+                   where name like 'tmp:wr-ins-%-runs' and value = 20) = 8
             then 'PASS' else 'FAIL' end
   from dual;
 
--- Knob 3: each path changed one row or document, the change is visible in
--- every read (collection, view, table), the neighbouring line is untouched,
--- and the view update landed in the line row.
+-- Knob 3: each path changed one row or document in each of 20 runs, the last
+-- change is visible in every read (collection, view, table), the neighbouring
+-- line is untouched, the view update landed in the line row, and the
+-- positional path addressed the same line.
 select 'ASSERT:wr-k3-change-visible:' ||
        case when (select value from m08_metrics where name = 'tmp:wr-k3-visible') = 1
              and (select value from m08_metrics where name = 'tmp:wr-k3-dv-in-table') = 1
+             and (select value from m08_metrics where name = 'tmp:wr-k3-pos-is-1500') = 1
              and (select count(*) from m08_metrics
-                   where name in ('wr-k3-col-rows', 'wr-k3-dv-rows', 'wr-k3-sql-rows') and value = 1) = 3
+                   where name in ('wr-k3-col-rows', 'wr-k3-colpos-rows', 'wr-k3-colrep-rows',
+                                  'wr-k3-dv-rows', 'wr-k3-sql-rows') and value = 1) = 5
              and (select count(*) from m08_metrics
-                   where name like 'tmp:wr-k3-%-runs' and value = 20) = 3
+                   where name like 'tmp:wr-k3-%-runs' and value = 20) = 5
+             and (select count(*) from m08_metrics
+                   where name like 'tmp:wr-fu-%-runs' and value = 20) = 2
             then 'PASS' else 'FAIL' end
   from dual;
 
@@ -863,9 +1053,13 @@ select 'ASSERT:wr-s4d-etag-controls:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- The MV refreshes at COMMIT and matches the tables after the last tier change.
+-- The MV refreshes at every COMMIT: it started at SILVER, every one of the 21
+-- phase-2 commits showed its new tier on all 100 MV rows, and after the last
+-- (GOLD) the MV matches the tables. Each arm changed the expected rows.
 select 'ASSERT:wr-mv-reflects-commit:' ||
        case when (select value from m08_metrics where name = 'tmp:wr-mv-reflects') = 1
+             and (select value from m08_metrics where name = 'tmp:wr-mv-start-silver') = 100
+             and (select value from m08_metrics where name = 'tmp:wr-mv-refreshed-runs') = 21
              and (select value from m08_metrics where name = 'tmp:wr-mv-mode-ok') = 1
              and (select count(*) from m08_metrics
                    where name like 'tmp:wr-mv-upd-%-runs' and value = 20) = 3
@@ -875,13 +1069,22 @@ select 'ASSERT:wr-mv-reflects-commit:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- Every measured statement has an executed plan with buffers, and none of the
--- updates or reads scanned a whole M08D_ table.
+-- When FAST ON COMMIT was accepted, the refreshes really were FAST.
+select 'ASSERT:wr-mv-refresh-fast:' ||
+       case when (select value from m08_metrics where name = 'wr-mv-fast-on-commit') = 0
+              or (select value from m08_metrics where name = 'tmp:wr-mv-last-refresh-fast') = 1
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+-- Every measured statement has an executed plan with buffers, none of them
+-- scanned a whole M08D_ table, and every v$sql window found statements.
 select 'ASSERT:wr-plans-captured:' ||
        case when (select count(*) from m08_metrics
-                   where name like 'tmp:wr-%-xplan-buffers' and value > 0) = 13
+                   where name like 'tmp:wr-%-xplan-buffers' and value > 0) = 19
              and (select count(*) from m08_metrics
                    where name like 'tmp:wr-%-full-scans' and value > 0) = 0
+             and (select count(*) from m08_metrics
+                   where name like 'tmp:wr-vs-%-classes' and value > 0) = 4
             then 'PASS' else 'FAIL' end
   from dual;
 
@@ -892,6 +1095,7 @@ delete from m08_metrics where name like 'wr-%' or name like 'tmp:wr-%';
 
 drop procedure if exists m08d_measure_mv;
 drop procedure if exists m08d_measure;
+drop package if exists m08d_h;
 drop materialized view if exists m08d_ord_cust_mv;
 drop view if exists m08d_s4ord_dv;
 drop view if exists m08d_s4cust_dv;
@@ -908,6 +1112,8 @@ drop table if exists m08d_emb purge;
 drop table if exists m08d_cust purge;
 drop table if exists m08d_samp purge;
 drop table if exists m08d_plan purge;
+drop table if exists m08d_vs purge;
+drop table if exists m08d_oson purge;
 
 select 'ASSERT:wr-teardown-clean:' ||
        case when (select count(*) from user_objects
