@@ -39,6 +39,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
 | S3 at scale (B) | `60` to `69` | "there is no data independence", and whether an unchanged app ever gains from a storage move | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads, CPU and elapsed time per call, from `v$sql`) and its plan captured. Results are the same at every stage. Costs are reported with no direction asserted; see the section for which statements got cheaper or slower and why. |
+| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that the write costs were half measured | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; whether renaming a customer changes the etag of every order document that nests it; and a materialized view as a third way to keep a copy in sync. Costs are reported with no direction asserted. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -71,7 +72,7 @@ cleans up after itself.
   (and `62`, `65` and `67` for S3 (B)) each move the
   storage one step and `COMMIT`, because the next stage has to see the change.
   The rollback after each script would otherwise undo the move.
-- **The S1, S1 (A), S1b, S2 and sweep (C) scripts commit their test data.** They build their own
+- **The S1, S1 (A), S1b, S2, sweep (C) and writes (D) scripts commit their test data.** They build their own
   `M08`-prefixed tables (DDL commits anyway) and commit the seeded rows so the
   measured statements read committed data.
 - **The cutover scripts recycle the API tier.** `02b-cutover-recycle-api.sh`
@@ -1048,12 +1049,216 @@ The executed plans need two grants beyond the earlier ones, in
 `docker/init/01-lab-user.sql`: `SELECT` on `V_$SQL_PLAN_STATISTICS_ALL` and
 `V_$SQL_PLAN_STATISTICS`, and `EXECUTE` on `DBMS_SHARED_POOL`.
 
+### Writes (D): writes through views, knob 3, etags, and a materialized view (`scripts/70-writes.sql`, `scripts/71-writes-api.js`)
+
+S2 measured one kind of write: a customer field copied into many orders. That
+left four questions open. What does it cost to write through a duality view?
+What does a small change to a large document cost (knob 3: which fields the
+writes change; Liu and Houlihan, *The Elements of Data*, forthcoming)? When a
+customer is renamed, does every order document that shows the customer get a
+new etag? And what about letting the database keep the copy in sync, with a
+materialized view? These two scripts measure all four and report what happens.
+No check compares costs.
+
+**How it is measured.** Logical reads, redo bytes and CPU come from the
+session statistics, taken around one write plus its `COMMIT`. The `COMMIT` is
+inside every window for two reasons: the materialized view refreshes at
+`COMMIT`, and a small transaction keeps its redo in a private buffer until
+`COMMIT`, so a window that closed earlier showed 0 redo for some writes. Each
+write runs once to warm up, then 20 more times; the tables show the median of
+the 20. The figures below are from one validator run. A second run repeated
+the reads within a few percent and the large redo figures within about 6%;
+small redo figures (under 2 KB) moved by up to 2 times (the knob-3 row update
+and view update wrote 884 bytes in one run and 440 in the other, equal to each
+other both times). The meter's own overhead is removed from reads and redo. Session
+statistics include recursive SQL, so the duality view's per-row statements and
+the materialized view's refresh are counted. CPU is at or below 1 centisecond
+for nearly every write here, so it does not separate them; only reads and redo
+do. The executed plan of every measured statement is printed as `PLAN` rows.
+
+**1. Insert an order with k lines.** Three ways to store the same order: one
+document into a JSON collection table; the same document through a duality
+view over an orders table and a lines table; and plain SQL, one order row plus
+k line rows in one `FORALL` (one array insert).
+
+| k | collection: reads / redo | duality view: reads / redo | plain SQL: reads / redo |
+|---|---|---|---|
+| 10 | 4 / 1,208 | 97 / 8,412 | 13 / 2,928 |
+| 100 | 8 / 4,156 | 932 / 94,240 | 20 / 11,464 |
+
+The document insert is one row and one index entry, so it is the cheapest. The
+plain SQL insert writes k + 1 rows and their index entries; the array insert
+keeps that to about 100 bytes of redo per line. The duality view writes the
+same rows as plain SQL, and it also sends the lines as one array insert per
+document (`v$sql`: 42 executions for 2,310 line rows), but its insert returns
+each row's etag (`RETURNING ... sys_row_etag`), and it costs about 9 reads and
+940 bytes of redo per line, roughly 8 times the plain SQL redo. These numbers
+do not show which part of the view's insert path causes the difference.
+Writing through the view is the convenient path, not the cheap one, and the
+cost grows with the number of child rows.
+
+**2. Knob 3: change one line's qty in a 1,000-line order.** The document is
+about 39 KB (`wr-k3-doc-bytes`), stored out of row.
+
+| Path | Reads | Redo (bytes) |
+|---|---|---|
+| collection, `JSON_TRANSFORM` on the one line | 32 | 28,260 |
+| duality view, the same `JSON_TRANSFORM` | 29 | 884 |
+| lines table, one-row `UPDATE` | 4 | 884 |
+
+The duality view writes exactly what the one-row `UPDATE` writes (the same
+redo), because it changes only the line row whose value changed. It reads more
+to get there: it rebuilds the order's 1,000 lines to find the change (the plan
+shows the line index range scan returning 1,000 rows). The collection update
+rewrites a large part of the stored document: about 28 KB of redo for a
+change of one number, 30 times the row update. That is knob 3 in one line: a
+small change to a large embedded document pays for the document's size, not
+the change's. Two of the 20 collection runs cost far more (864 reads and
+301,428 bytes of redo at most), probably LOB space management (not checked); the
+median ignores them.
+
+**3. The same change through the MongoDB API** (`71`): `updateOne` with a
+positional `$set` (`{'lines.$.qty': q}`), on a collection and on a duality
+view of the same shape. The API does not send one `UPDATE`. For both targets
+it reads the whole document with `SELECT ... FOR UPDATE`, applies the `$set`
+in the API tier, and writes the whole document back. The table lists each
+statement the database ran and its share, from `v$sql`, and the session total
+from `v$mystat` (read through `$sql` in the API's own session; the session id
+was the same before and after).
+
+| Target | Statements per call | Reads per call (session) | Redo per call (session) |
+|---|---|---|---|
+| collection | 2: select for update, update of the document | 64 | 54,419 |
+| duality view | 5: select for update (about 2,050 reads), two etag reads, the one-row line update, the view update | 2,100 | 225,023 |
+
+The duality view still changes only one line row, but the API's read with
+`FOR UPDATE` locks all 1,001 rows of the order, and each row lock writes redo.
+That is most of the 225 KB: the same `SELECT ... FOR UPDATE` on the view, run
+alone in SQL, wrote 225,260 bytes of redo (on the collection, 1,384). Through SQL the same change cost 29 reads and 884
+bytes. The API's read-modify-write is the cost here, not the view. An app that
+changes one line of a large order through the view will do better with SQL
+(`JSON_TRANSFORM` or a row update) than with a positional `$set`.
+
+**4. Etags after a rename (the S4 shape).** Two duality views over customers,
+orders and lines: a customer-centric one, and an order-centric one with a
+nested, read-only customer `{custId, name}`. The script records each order
+document's `_metadata.etag`, renames customer 1 once through the customer
+view, and reads the order documents again.
+
+- All 5 of customer 1's order documents have a new etag
+  (`wr-s4d-etags-changed` = 5); customer 2's 3 orders do not
+  (`wr-s4d-other-etags-changed` = 0). The rename itself wrote one row (956
+  bytes of redo, 36 reads, commit included).
+- A write to order 1 with the etag read before the rename is refused with
+  ORA-42699, the etag mismatch (`wr-s4d-stale-write-rejected` = 1), and changes
+  nothing.
+
+So the rename does not rewrite any order: the etag is computed from the rows
+when the document is read, and the nested customer's fields are part of it by
+default. The effect is on concurrency, not on storage. A client that read an
+order before the rename and writes it back afterwards gets a conflict and
+must read again, even though nothing in the order itself changed. That is the
+same rule as for any other change to a document the client holds, and it is
+the safe default. A view can leave fields out of the etag (the `NOCHECK`
+annotation); this script does not measure that.
+
+Two controls show the check works: a fresh read written back is accepted, and
+a write with the etag from before the writer's own change is refused.
+
+**5. A materialized view arm.** S2's data shape (100,000 customers, 20,100
+orders, customer 1 has 100). One order is read with its customer's name and
+tier, and customer 1's tier changes, three ways:
+
+- embedded: order documents carrying the customer snapshot, as in S2;
+- normalized: the order and customer tables, read with a join;
+- materialized view: the normalized tables plus `M08D_ORD_CUST_MV`, a join
+  materialized view (order plus customer name and tier) with materialized view
+  logs, `REFRESH FAST ON COMMIT`. 26ai Free accepted FAST ON COMMIT for this
+  shape (`wr-mv-fast-on-commit` = 1). Its rowid columns are indexed, as the
+  documentation advises.
+
+The normalized tier change was measured before the logs existed, so it pays
+no log cost.
+
+| Arm | Order read: reads | Tier change + COMMIT: rows | reads | redo (bytes) |
+|---|---|---|---|---|
+| embedded | 3 | 100 documents | 1,107 | 157,772 |
+| normalized (join) | 6 | 1 row | 4 | 908 |
+| materialized view | 3 | 1 row (+100 view rows at COMMIT) | 1,988 | 178,028 |
+
+The materialized view reads like the embedded document (3 reads, one index
+probe and one row) and stays correct after every `COMMIT` (checked). But it
+moves the fan-out, it does not remove it: the refresh at `COMMIT` deletes and
+re-inserts customer 1's 100 view rows (`v$sql`: the refresh's `DELETE` and
+`INSERT` each process 100 rows per `COMMIT`), which costs more reads and more redo
+than updating the 100 embedded copies directly. The database keeps the copy
+in sync, so the app cannot forget a copy, and the cost of the copy is still
+paid on every change. Only the normalized form pays for the change once.
+
+**What it shows.** Writes are where the shape of the stored data shows up
+most. A document is the cheapest thing to insert and the most expensive thing
+to change a little of. Rows are cheap to change and cost more to insert. A
+duality view changes exactly the rows that changed, but costs more reads than
+a plain row update to find them, and its inserts go row by row. The MongoDB
+API's read-modify-write makes both targets pay for the whole document. Etags
+make a rename visible to every client that holds a nesting document, without
+rewriting any of them. A materialized view keeps a copy in sync for you, at
+about the price of keeping it in sync yourself.
+
+Expected assertions:
+
+```
+ASSERT:wr-insert-same-content:PASS
+ASSERT:wr-k3-change-visible:PASS
+ASSERT:wr-s4d-rename-visible:PASS
+ASSERT:wr-s4d-etag-controls:PASS
+ASSERT:wr-mv-reflects-commit:PASS
+ASSERT:wr-plans-captured:PASS
+ASSERT:wr-teardown-clean:PASS
+ASSERT:wr-api-one-doc-per-call:PASS
+ASSERT:wr-api-change-visible:PASS
+ASSERT:wr-api-statements-found:PASS
+ASSERT:wr-api-teardown-clean:PASS
+```
+
+- `insert-same-content`: for every k and run, the order read back as the
+  collection document, the duality-view document and the table rows has the
+  same customer, status, total, line count and lines (number, sku, qty).
+- `k3-change-visible`: each path changed one row or document 20 times; the
+  last value shows in the collection, the view and the lines table; the line
+  next to it is unchanged; both documents still have 1,000 lines; and the view
+  update landed in the line row.
+- `s4d-rename-visible`: the rename changed one customer document, all 5 order
+  documents show the new name, and the etag results were recorded.
+- `s4d-etag-controls`: a fresh document is accepted and a document changed
+  since it was read is refused with the etag error.
+- `mv-reflects-commit`: the materialized view refreshes on `COMMIT` and
+  matches the tables for all 100 of customer 1's orders after the last change;
+  each arm changed the expected number of rows.
+- `plans-captured`: all 13 measured statements have an executed plan with
+  buffers, and none scanned a whole table.
+- `api-one-doc-per-call`: every `updateOne` matched and modified one document.
+- `api-change-visible`: the last value shows through the API and in SQL for
+  both targets, and the other 999 lines are unchanged.
+- `api-statements-found`: the `v$sql` window found the statements the API ran.
+
+Metrics (all `wr-*`): `wr-ins-<path>-k<k>-...`, `wr-k3-<path>-...` and
+`wr-mv-upd-<arm>-...` with `-reads-median`, `-reads-max`, `-redo-median`,
+`-redo-max`, `-cpu-cs-median`, `-cpu-cs-max` and `-elapsed-cs-median`;
+`wr-mv-read-<arm>-...` from the meter's `measure_repeat`; `wr-s4d-*`;
+`wr-mv-fast-on-commit`; `wr-k3-doc-bytes`; and from `71`,
+`wr-api-<target>-statements`, `-vsql-gets-per-call`, `-vsql-cpu-us-per-call`,
+`-same-session`, `-session-reads-per-call`, `-session-redo-per-call` and
+`-session-cpu-cs-per-call`. The `v$sql` sum for the duality view counts the
+view update's recursive line update twice (once inside the view update's own
+gets), so the session figure is the one to quote.
+
 ## Teardown: `scripts/99-teardown.sql`
 
 Empties and drops the meter's session table `m08_metrics`, drops the
 `m08_meter` package, and then checks that nothing from this module is left in
 the schema. The check lists every name the module uses, matched without regard
-to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08B3_`, `M08C1_`, `M08C2_`, `M08S2_`,
+to case: the prefixes `M08_`, `M08A_`, `M08B_`, `M08B3_`, `M08C1_`, `M08C2_`, `M08D_` (with the materialized view log tables `MLOG$_M08D_*` and `RUPD$_M08D_*`), `M08S2_`,
 `M08S4_` and `M08S5_` (which covers the `m08s5_single` collection, and `M08B3_` the
 `m08b3_orders` and `m08b3_runs` collections), and the S3 names `sales_orders`,
 `SALES_ORDERS_T`, `SALES_ORDER_LINES`, `SALES_ORDERS_V0` and `probe_runs`.
