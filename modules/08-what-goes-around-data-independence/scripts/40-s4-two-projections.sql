@@ -8,6 +8,9 @@
 --   m08s4_cust_dv : customer-centric. A customer with its orders[] (each with lines[]).
 --   m08s4_ord_dv  : order-centric. An order with its lines[] and a nested
 --                   customer {custId, name}, read-only in this view.
+-- The customer-centric view is created before the data is loaded, the
+-- order-centric one after it: adding a second shape over stored data is one view
+-- definition, not a data migration.
 -- Customer 1 has 5 orders. Its name is changed once, through the customer-centric
 -- view. Every one of its 5 order documents, read through the order-centric view,
 -- shows the new name at once: no sync job, no fan-out update, because the name is
@@ -16,6 +19,7 @@
 
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08s4_check;
+drop procedure if exists m08s4_fingerprint;
 drop view if exists m08s4_ord_dv;
 drop view if exists m08s4_cust_dv;
 drop table if exists m08s4_line purge;
@@ -66,7 +70,49 @@ select json {'_id'    : c.cust_id,
                            where o.cust_id = c.cust_id ]}
   from m08s4_cust c with insert update delete;
 
--- ===== Projection 2: order-centric document =====
+-- ===== Data =====
+-- 3 customers. Customer 1 has orders 1 to 5, customer 2 has orders 6 to 8,
+-- customer 3 has none. Every order has 2 lines.
+insert into m08s4_cust (cust_id, name)
+  select level, 'Customer ' || level from dual connect by level <= 3;
+
+insert into m08s4_ord (ord_id, cust_id, status, total)
+  select level, case when level <= 5 then 1 else 2 end, 'OPEN', level * 10
+    from dual connect by level <= 8;
+
+insert into m08s4_line (line_id, ord_id, sku, qty)
+  select level, ceil(level / 2), 'SKU-' || level, 1 from dual connect by level <= 16;
+
+commit;
+
+-- Fingerprint of the stored data before the second view exists: tables,
+-- columns (system-generated ones included) and a hash of every row.
+create or replace procedure m08s4_fingerprint(p_name varchar2) as
+  t number; c number; h number;
+begin
+  select count(*) into t from user_tables where table_name like 'M08S4\_%' escape '\';
+  select count(*) into c
+    from user_tab_cols tc join user_tables ut on ut.table_name = tc.table_name
+   where tc.table_name like 'M08S4\_%' escape '\';
+  select (select nvl(sum(ora_hash(cust_id || '|' || name)), 0) from m08s4_cust)
+       + (select nvl(sum(ora_hash(ord_id || '|' || cust_id || '|' || status || '|' || total)), 0) from m08s4_ord)
+       + (select nvl(sum(ora_hash(line_id || '|' || ord_id || '|' || sku || '|' || qty)), 0) from m08s4_line)
+    into h from dual;
+  m08_meter.record('tmp:s4-fp-' || p_name || '-tables', t);
+  m08_meter.record('tmp:s4-fp-' || p_name || '-cols', c);
+  m08_meter.record('tmp:s4-fp-' || p_name || '-rows', h);
+end;
+/
+
+begin
+  m08s4_fingerprint('before');
+end;
+/
+
+-- ===== Projection 2: order-centric document, added after the data =====
+-- The orders are already stored and committed. Adding this second shape is one
+-- view definition: no table is created or altered and no row is written, and
+-- the view returns the existing orders at once (checked below).
 -- The nested customer is read-only here: this view can show the name but not
 -- change it. The customer-centric view owns that change.
 create json relational duality view m08s4_ord_dv as
@@ -84,18 +130,35 @@ select json {'_id'      : o.ord_id,
                              where l.ord_id = o.ord_id ]}
   from m08s4_ord o with insert update delete;
 
--- ===== Data =====
--- 3 customers. Customer 1 has orders 1 to 5, customer 2 has orders 6 to 8,
--- customer 3 has none. Every order has 2 lines.
-insert into m08s4_cust (cust_id, name)
-  select level, 'Customer ' || level from dual connect by level <= 3;
-
-insert into m08s4_ord (ord_id, cust_id, status, total)
-  select level, case when level <= 5 then 1 else 2 end, 'OPEN', level * 10
-    from dual connect by level <= 8;
-
-insert into m08s4_line (line_id, ord_id, sku, qty)
-  select level, ceil(level / 2), 'SKU-' || level, 1 from dual connect by level <= 16;
+-- The new view returns the orders that were stored before it existed, and the
+-- stored data did not change.
+declare
+  docs  number;
+  lines number;
+  names number;
+  ok    number;
+begin
+  m08s4_fingerprint('after');
+  select count(*),
+         nvl(sum(json_value(d.data, '$.lines.size()' returning number)), 0),
+         count(case when json_value(d.data, '$.customer.name') = c.name then 1 end)
+    into docs, lines, names
+    from m08s4_ord_dv d
+    join m08s4_ord o on o.ord_id = d.data."_id".number()
+    join m08s4_cust c on c.cust_id = o.cust_id;
+  m08_meter.record('s4-order-view-docs-after-load', docs);
+  m08_meter.record('tmp:s4-order-view-lines-after-load', lines);
+  m08_meter.record('tmp:s4-order-view-names-after-load', names);
+  select case when count(distinct p.name) = 3 and count(*) = 3 then 1 else 0 end
+    into ok
+    from (select substr(name, length('tmp:s4-fp-before-') + 1) name, value from m08_metrics
+           where name like 'tmp:s4-fp-before-%') p
+    join (select substr(name, length('tmp:s4-fp-after-') + 1) name, value from m08_metrics
+           where name like 'tmp:s4-fp-after-%') a
+      on a.name = p.name and a.value = p.value;
+  m08_meter.record('tmp:s4-data-unchanged', ok);
+end;
+/
 
 -- ===== Change once, read everywhere =====
 create or replace procedure m08s4_check as
@@ -245,6 +308,17 @@ select 'ASSERT:s4-order-view-shape:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
+-- The order-centric view, created after the load, returns all 8 stored orders
+-- with their 16 lines and the right customer names, and creating it changed no
+-- table, column or row.
+select 'ASSERT:s4-second-view-after-load:' ||
+       case when (select value from m08_metrics where name = 's4-order-view-docs-after-load') = 8
+             and (select value from m08_metrics where name = 'tmp:s4-order-view-lines-after-load') = 16
+             and (select value from m08_metrics where name = 'tmp:s4-order-view-names-after-load') = 8
+             and (select value from m08_metrics where name = 'tmp:s4-data-unchanged') = 1
+            then 'PASS' else 'FAIL' end
+  from dual;
+
 -- The nested customer is read-only in the order-centric view.
 select 'ASSERT:s4-order-view-customer-readonly:' ||
        case when (select value from m08_metrics where name = 'tmp:s4-readonly-in-order-view') = 1
@@ -257,6 +331,7 @@ select 'ASSERT:s4-order-view-customer-readonly:' ||
 delete from m08_metrics where name like 's4-%' or name like 'tmp:s4-%';
 
 drop procedure if exists m08s4_check;
+drop procedure if exists m08s4_fingerprint;
 drop view if exists m08s4_ord_dv;
 drop view if exists m08s4_cust_dv;
 drop table if exists m08s4_line purge;

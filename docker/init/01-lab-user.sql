@@ -21,7 +21,6 @@ BEGIN
   -- Module 08 S3 (B): executed-plan row-source statistics (dbms_xplan
   -- 'ALLSTATS LAST') and purging one statement's cursor between measurements.
   EXECUTE IMMEDIATE 'GRANT SELECT ON SYS.V_$SQL_PLAN_STATISTICS_ALL TO lab_user';
-  EXECUTE IMMEDIATE 'GRANT SELECT ON SYS.V_$SQL_PLAN_STATISTICS TO lab_user';
   EXECUTE IMMEDIATE 'GRANT EXECUTE ON SYS.DBMS_SHARED_POOL TO lab_user';
   -- Module 08 writes (D): undo records of the session's open transaction
   -- (how many rows a SELECT ... FOR UPDATE locked).

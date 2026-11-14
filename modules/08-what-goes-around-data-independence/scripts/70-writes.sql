@@ -425,7 +425,9 @@ create or replace package body m08d_h as
       begin
         sys.dbms_shared_pool.purge(c.n, 'C');
       exception
-        when others then null;
+        -- A failed purge leaves an old count in the window; record it so it
+        -- shows as wr-purge-failures instead of passing silently.
+        when others then m08_meter.record('tmp:wr-purge-failed', 1);
       end;
     end loop;
     vs_take(p_label, 0);
@@ -693,7 +695,7 @@ begin
   -- ----- Part 1: inserts -----
   for k in (select 10 k from dual union all select 100 from dual) loop
     insert_path('col', k.k);
-    m08d_h.vs_snap('ins-dv-k' || k.k, '"LAB_USER"\."M08D_');
+    m08d_h.vs_snap('ins-dv-k' || k.k, '"' || sys_context('userenv', 'current_schema') || '"\."M08D_');
     insert_path('dv', k.k);
     m08d_h.vs_done('ins-dv-k' || k.k, 21);
     insert_path('sql', k.k);
@@ -731,7 +733,7 @@ begin
   knob3('col');
   knob3('colpos');
   knob3('colrep');
-  m08d_h.vs_snap('k3-dv', '"LAB_USER"\."M08D_');
+  m08d_h.vs_snap('k3-dv', '"' || sys_context('userenv', 'current_schema') || '"\."M08D_');
   knob3('dv');
   m08d_h.vs_done('k3-dv', 21);
   -- After the duality-view update, the change is in the line row.
@@ -987,6 +989,9 @@ end;
 /
 
 -- ===== Measurements (as METRIC rows) and executed plans (as PLAN rows) =====
+-- Cursor purges that failed in vs_snap (0 when every purge worked).
+select 'METRIC:wr-purge-failures:' || count(*) from m08_metrics where name = 'tmp:wr-purge-failed';
+
 select 'METRIC:' || name || ':' ||
        case when value = trunc(value) then to_char(value, 'FM999999990')
             else to_char(value, 'FM999999990.00') end

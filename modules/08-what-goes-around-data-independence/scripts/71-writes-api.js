@@ -92,17 +92,27 @@ const cursors = (pat) => sql(`select sql_id, child_number c, executions e, buffe
 const key = (x) => x.SQL_ID + '/' + x.C;
 // Purge the target's cursors first, so their counts start fresh (a cursor
 // reloaded after an earlier run's DROP would otherwise mis-count).
-const purge = (pat) => sql(`begin
+// A purge that fails is not fatal (the counts are deltas), but it is made
+// visible: the cursors still left afterwards are reported as
+// wr-api-<target>-purge-left (0 when every purge worked).
+const purge = (pat) => {
+  sql(`begin
   for c in (select distinct address || ',' || hash_value n from v$sql
              where upper(sql_text) like '${pat}' and upper(sql_text) not like '%V$SQL%') loop
     begin sys.dbms_shared_pool.purge(c.n, 'C'); exception when others then null; end;
   end loop;
 end;`);
+  return Number(sql(`select count(*) n from v$sql
+                      where upper(sql_text) like :1 and upper(sql_text) not like '%V$SQL%'`, bind1(pat))[0].N);
+};
+// The schema the API works in (the line table's owner in the generated SQL).
+const SCHEMA = sql(`select sys_context('userenv', 'current_schema') s from dual`)[0].S;
+const LINE_UPDATE = new RegExp('^update "' + SCHEMA + '"\\."M08D_API_LINE"', 'i');
 // Statement class, for one METRIC per kind of statement the API ran.
 const cls = (t) => /for update/i.test(t) ? 'select-for-update'
   : /DRDUALV/.test(t) ? 'etag-select-dr'
   : /DUALV/.test(t) ? 'etag-select'
-  : /^update "LAB_USER"\."M08D_API_LINE"/i.test(t) ? 'update-line'
+  : LINE_UPDATE.test(t) ? 'update-line'
   : /^update/i.test(t) ? 'update-doc'
   : 'other';
 const diff = (b, a, k) => Number(a[k]) - Number(b[k]);
@@ -111,7 +121,8 @@ function measure(label, coll, pat) {
   const C = db.getCollection(coll);
   const results = [];
   const upd = (q) => C.updateOne({ _id: 1, 'lines.lineId': LINE }, { $set: { 'lines.$.qty': q } });
-  purge(pat);
+  const purgeLeft = purge(pat);
+  print('METRIC:wr-api-' + label + '-purge-left:' + purgeLeft);
   results.push(upd(500)); // warm-up
   // Empty window: the snapshot queries alone.
   const e0 = mystat();

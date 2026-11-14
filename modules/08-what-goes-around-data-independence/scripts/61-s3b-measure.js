@@ -33,8 +33,9 @@
 // a duality view cannot order a nested array). Each stage must match stage 0.
 //
 // Checks: same results as stage 0, a plan captured for every statement, every
-// measured cursor executed at least once per call, and the executed plan has
-// the same plan hash as the measured cursor. No check compares costs: the
+// measured cursor executed at least once per call, every purge left no cursor
+// of its sql_id in v$sql, and the executed plan has the same plan hash as the
+// measured cursor (statements and controls). No check compares costs: the
 // costs are reported, not asserted.
 
 const NAME = 'm08b3_orders';
@@ -128,11 +129,18 @@ const vsql = (id) => sql(`select nvl(sum(executions), 0) e, nvl(sum(buffer_gets)
                             from v$sql where sql_id = :1`, bind1(id))[0];
 const children = (id) => sql(`select child_number, to_char(plan_hash_value) phv, executions
                                 from v$sql where sql_id = :1 order by child_number`, bind1(id));
-const purge = (id) => sql(`begin
+// Purge every cursor of a sql_id, then check that none is left in v$sql
+// (purgeOk turns false if one is).
+let purgeOk = true;
+const purge = (id) => {
+  sql(`begin
   for c in (select address || ',' || hash_value n from v$sql where sql_id = '${id}') loop
     sys.dbms_shared_pool.purge(c.n, 'C');
   end loop;
 end;`);
+  const left = Number(sql(`select count(*) n from v$sql where sql_id = :1`, bind1(id))[0].N);
+  if (left !== 0) { print('purge left ' + left + ' cursor(s) of ' + id); purgeOk = false; }
+};
 const grew = (before, after) => {
   // the child whose executions grew the most between two children() snapshots
   let best = null;
@@ -203,7 +211,8 @@ for (const c of CONTROLS[STAGE] || []) {
   const found = sql(`select sql_id from v$sql where sql_text like :1 and rownum = 1`, bind1('select ' + c.tag + '%'));
   if (!found.length) { print('control ' + c.name + ': sql_id not found'); measuredOk = false; continue; }
   const m = measure('ctl-' + c.name, found[0].SQL_ID, run);
-  if (m.execs < RUNS || !/Buffers/.test(m.xplan)) measuredOk = false;
+  if (m.execs < RUNS) measuredOk = false;
+  if (!/Buffers/.test(m.xplan) || m.measuredPhv === null || m.measuredPhv !== m.xplanPhv) xplanOk = false;
   rec.controls[c.name] = { text: c.text, rows: m.rows.length, gets: m.gets, cpuUs: m.cpuUs, xplan: m.xplan };
 }
 
@@ -215,6 +224,7 @@ runs.insertOne(rec);
 print('ASSERT:s3b-stage' + STAGE + '-plans-captured:' + (plansOk ? 'PASS' : 'FAIL'));
 print('ASSERT:s3b-stage' + STAGE + '-executed-plan-matches:' + (xplanOk ? 'PASS' : 'FAIL'));
 print('ASSERT:s3b-stage' + STAGE + '-measured:' + (measuredOk ? 'PASS' : 'FAIL'));
+print('ASSERT:s3b-stage' + STAGE + '-purge-effective:' + (purgeOk ? 'PASS' : 'FAIL'));
 
 // Same results as stage 0, statement by statement.
 const base = runs.findOne({ _id: 'stage0' });

@@ -32,14 +32,14 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
 | S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does no more logical reads than the best indexed join, in both a clustered and an interleaved layout. The join's cost grows with the number of lines. The duality view is a join and costs at least as much as the document. (See S1 (A): a hash cluster beats the document up to 100 lines.) |
-| S1 (A) | `12-s1-physical-join.sql` | the same claim, against the physical designs measured here | S1's join used a heap table with a single-column index. This reruns the interleaved case against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster and a duality view over the IOT, and reports the reads with no direction asserted between the document and any join. The hash cluster beats the document for orders of up to 100 lines; at 1,000 lines the document does the fewest reads. |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the hostile objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster and a duality view over the IOT, with no direction asserted. **Result: the hash cluster beats the document for orders of up to 100 lines (2 reads against 3).** At 1,000 lines the document does the fewest reads. The other designs need about 2 to 2.3 times the document's reads up to 100 lines. |
 | S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, when such a crossover exists. |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
-| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the same claims, against the objection that the S1b and S2 crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. Each crossover falls about in inverse proportion to its parameter; a crossover exists at every point. |
-| S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
+| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant.** A crossover exists at every point. |
+| S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
-| S3 at scale (B) | `60` to `69` | "there is no data independence", and whether an unchanged app ever gains from a storage move | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads, CPU and elapsed time per call, from `v$sql`) and its plan captured. Results are the same at every stage. Costs are reported with no direction asserted; see the section for which statements got cheaper or slower and why. |
-| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that the write costs were half measured | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; whether renaming a customer changes the etag of every order document that nests it; and a materialized view as a third way to keep a copy in sync. Costs are reported with no direction asserted. |
+| S3 at scale (B) | `60` to `69` | "there is no data independence", and the hostile objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection.** On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
+| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the hostile objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and the MongoDB API's `$set` on a duality view locks every child row of the document** (1,001 rows to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -61,6 +61,26 @@ one aggregation alone takes 1.5 to 3.5 seconds per call for 21 calls.
 
 Numbers for the article come only from `validator/results.json`, under
 `"metrics"`.
+
+**Grants on a stack that is already running.** The database grants the
+scripts need are in `docker/init/01-lab-user.sql`, which runs only when the
+data volume is first created. If your stack was built before a grant was added
+there (for example `SELECT` on `V_$TRANSACTION`, for the writes scenario), run
+the file again as SYS. It is safe to run more than once:
+
+```bash
+docker exec -i lab-oracle sqlplus -s / as sysdba < docker/init/01-lab-user.sql
+```
+
+## Build measured
+
+Every scenario in this module was measured on one build: Oracle AI Database
+26ai Free, `Release 23.26.0.0.0` (from `v$version`), in the lab image built
+from `gvenzl/oracle-free:23.26.0-faststart`, with Oracle REST Data Services
+`26.3.1.r3031615` serving the MongoDB API. Every statement in this README
+about how the product behaves means "on this build". Plans, costs and some
+behavior (for example, which predicates a duality view pushes down) can
+differ on other builds.
 
 ## The commit exception
 
@@ -108,7 +128,7 @@ later scripts use to measure work. Safe to run more than once.
     rows is real.
   - JSON and LOB columns: a bare column comes back as a pointer (a locator),
     so the document or LOB body is never read and the reads are under-counted.
-    The helper refuses them (`ORA-20802`). For a document, select
+    The helper refuses them with an error. For a document, select
     `json_serialize(<col> returning blob)`, which builds the whole document,
     and pass `p_allow_lob => TRUE`. To read a stored LOB's bytes, use
     `dbms_lob`.
@@ -303,8 +323,9 @@ medians are 0 cs for every reader, so time does not separate them here.
 
 The physical designs measured here close most of the gap, and that is the
 honest headline. Against the heap join the document does about 100 times fewer
-reads at 1,000 lines. Against the other designs measured here the gap is at
-about 2 to 2.3 times, and one design wins outright. The IOT, compressed IOT, index cluster, covering index and
+reads at 1,000 lines. Against the other designs measured here the gap is
+about 2 to 2.3 times for orders of up to 100 lines (1.25 to 1.75 times at
+1,000 lines), and one design wins outright. The IOT, compressed IOT, index cluster, covering index and
 duality view need 6 or 7 reads up to 100 lines (the document needs 3) and 10
 to 14 at 1,000 lines (the document needs 8). **The hash cluster beats the
 document for orders of 1, 10 and 100 lines**: 2 reads against 3, because it
@@ -591,10 +612,11 @@ its numbers from `validator/results.json`):
 | 1000 | 100 | 3 | 603 | 8 | 14 | 10 |
 | 1000 | 500 | 5 | 2649 | 8 | 14 | 2.27 |
 
-The k = 1,000 join read was 14 in three validator runs and 15 in one. One read
+The k = 1,000 join read was 14 in six validator runs and 15 in two (one of
+them the first run on a freshly built database). One read
 in the numerator moves every k = 1,000 crossover by about 15% (200 to 233 at
-M = 5, 2.27 to 2.65 at M = 500), as S1b warned. The k = 100 figures were the same in
-both runs.
+M = 5, 2.27 to 2.65 at M = 500), as S1b warned. The k = 100 figures were the
+same in all eight runs.
 
 **How strongly it depends on M: about in inverse proportion.** The child table
 answers from the covering index in 2 to 5 reads whatever M is. The order
@@ -705,12 +727,21 @@ correctness check, not a measurement.
 
 The canonical form is three normalized tables: customers, orders, and order
 lines. Each customer's name is stored once, in the customer row. Two duality
-views project that one canonical form as two different documents:
+views project that one canonical form as two different documents. The
+customer-centric view is created before the data is loaded; the order-centric
+view is created after the data is loaded and committed, the way a second
+application would arrive later:
 
 | View | Document | Can it change the customer name? |
 |---|---|---|
 | `m08s4_cust_dv` | a customer with its `orders[]`, each with its `lines[]` | yes |
 | `m08s4_ord_dv` | an order with its `lines[]` and a nested `customer {custId, name}` | no, the nested customer is read-only here |
+
+When the order-centric view is created, the script checks that it returns all
+8 stored orders at once, with their 16 lines and the right customer names, and
+that creating it changed nothing stored: the same tables, the same columns
+(system-generated ones included) and the same hash over every row, before and
+after.
 
 Customer 1 has 5 orders. The script changes customer 1's name once, through the
 customer-centric view (`JSON_TRANSFORM` on the document). Then it reads all 5
@@ -726,8 +757,9 @@ of the name to change.
   and the order and line tables have no name column at all.
 - **Data independence.** One canonical form serves two document shapes. Neither
   application has to know how the data is stored, and neither shape forces a
-  storage layout on the other. Adding the second shape took one view definition,
-  not a data migration.
+  storage layout on the other. Adding the second shape over data that was
+  already stored took one view definition, not a data migration
+  (`s4-second-view-after-load`).
 - **Clear ownership of each change.** The order-centric view can show the name
   but cannot change it. The database refuses the attempt; only the
   customer-centric view changes the name.
@@ -743,6 +775,7 @@ ASSERT:s4-one-row-changed:PASS
 ASSERT:s4-order-view-reflects:PASS
 ASSERT:s4-no-copies:PASS
 ASSERT:s4-order-view-shape:PASS
+ASSERT:s4-second-view-after-load:PASS
 ASSERT:s4-order-view-customer-readonly:PASS
 ASSERT:s4-teardown-clean:PASS
 ```
@@ -757,6 +790,10 @@ ASSERT:s4-teardown-clean:PASS
   `customer.name` and no `orders` array; the customer document has an `orders`
   array of 5 and no nested customer. The two projections really are different
   shapes.
+- `s4-second-view-after-load`: the order-centric view, created after the data
+  was loaded and committed, returns all 8 orders with their 16 lines and each
+  order's customer name, and the tables, columns and rows are the same before
+  and after it was created.
 - `s4-order-view-customer-readonly`: the dictionary marks the customer table
   read-only in the order-centric view, and an attempt to change the name through
   it is refused.
@@ -765,6 +802,7 @@ Metrics:
 
 - `s4-docs-updated`;
 - `s4-order-docs-showing-new-name`;
+- `s4-order-view-docs-after-load`;
 - `s4-name-copies`.
 
 ### S5: one request for a parent and all its children (`scripts/50-s5-single-collection.js`)
@@ -849,10 +887,8 @@ moves, on 8 orders, and measures no cost. This runs the same four stages on a
 separate collection, `m08b3_orders`, with 20,000 orders, and measures what each
 unchanged app statement costs at each stage.
 
-**Build measured:** Oracle AI Database 26ai Free, `Release 23.26.0.0.0`
-(`v$version`), with Oracle REST Data Services `26.3.1.r3031615` serving the
-MongoDB API. Every statement below about how the product behaves means "on this
-build".
+The build is the one named under "Build measured" above; every statement below
+about how the product behaves means "on this build".
 
 **Data** (`60-s3b-seed.js`). 20,000 orders, seeded through the MongoDB API with
 `insertMany` in batches of 1,000 from a fixed-seed generator, so every run
@@ -884,7 +920,8 @@ carry one.
 `63-s3b-cutover-recycle-api.sh` restarts the API tier after the 0 to 1 move,
 as in S3, and checks that the four measuring scripts are identical. The
 stage-0 indexes are made on the empty collection, before the load: on this
-build, `createIndex` on a loaded collection fails with ORA-00910, because
+build, `createIndex` on a loaded collection fails ("specified length too long
+for its datatype"), because
 `MAX_STRING_SIZE` is `STANDARD`. The stage-3 lines are loaded by one
 `INSERT ... SELECT`, so each order's lines sit together, which is the friendly
 layout for the view's join (S1 measures the interleaved one).
@@ -903,8 +940,9 @@ and work out the stage from the schema):
 
 **How it is measured.** For each statement at each stage: `explain()` through
 the MongoDB API gives the SQL the API generated, its `sql_id` and the plan.
-The statement's cursors are purged (`dbms_shared_pool.purge`), so each one is
-parsed for its own value; `SKU-HOT` and `SKU-RARE` share one SQL text and
+The statement's cursors are purged (`dbms_shared_pool.purge`, checked: no
+cursor of that `sql_id` is left afterwards), so each one is parsed for its own
+value; `SKU-HOT` and `SKU-RARE` share one SQL text and
 would otherwise share one plan. Then one warm-up run and 20 measured runs, each
 fetching every result document. Buffer gets (logical reads), CPU and elapsed
 time are the growth of `v$sql` for that `sql_id` over the 20 runs, divided by
@@ -916,9 +954,17 @@ match the measured cursor's. The API sends the same SQL text at every stage
 (the `sql_id` does not change), because it queries the name `m08b3_orders`,
 whatever is behind it.
 
-**Results** (validator run of fix round 1, run 1; the article takes its
-numbers from `validator/results.json`). Logical reads per call, with CPU per
-call in milliseconds in brackets:
+**Cheaper, the same, or slower.** Both logical reads and CPU per call count,
+each compared with the stage named. Reads within about 1%, and CPU within
+about 10% or under 0.1 ms per call, count as unchanged. A statement is
+*cheaper* when one of the two goes down and the other does not go up, *slower*
+when one goes up and the other does not go down, and *the same* when neither
+changes. When one goes down and the other up, the text names both.
+
+**Results** (from one validator run on the lab container; reruns move the
+reads by about 1%, and the article takes its numbers from
+`validator/results.json`). Logical reads per call, with CPU per call in
+milliseconds in brackets:
 
 | Statement | Stage 0 (collection) | Stage 1 (view, JSON column) | Stage 2 (promoted columns) | Stage 3 (lines table) |
 |---|---|---|---|---|
@@ -944,9 +990,13 @@ statements):
 **Plain reading.**
 
 - **No statement is cheaper at any later stage than on the plain collection.**
-  The best any of them does is tie (`byid` at stages 1 and 2).
-- **Stage 0 to 1, the day-one cost of putting a view in front: five of six
-  statements got slower; `byid` stayed the same.** On this build, MongoDB API
+  The best any of them does is tie (`byid` at stages 1 and 2: the same 3
+  reads, CPU under 0.1 ms per call). `agg-unwind` at stages 1 and 2 is mixed:
+  about 5% fewer reads, but about 60% more CPU.
+- **Stage 0 to 1, the day-one cost of putting a view in front: four of six
+  statements got slower on both reads and CPU; `agg-unwind` read about the same
+  (1,589 to 1,508, 5% fewer) but its CPU went up (1.5 to 2.4 seconds); `byid`
+  stayed the same.** On this build, MongoDB API
   filters on fields stored in the flex column are applied to the constructed
   document and cannot use indexes on the underlying column; fields mapped to
   real columns (here only `_id`) are pushed down. The executed plan is a full
@@ -968,7 +1018,8 @@ statements):
   `(status, customer)` for `agg-status` was tried by hand: its plan stayed a
   full scan, because the generated SQL reads the whole document (`DATA`) from
   the view, so it was not kept.
-- **Stage 2 to 3: `sku-rare` and `sku-hot` got cheaper; the other four got
+- **Stage 2 to 3: `sku-rare` got cheaper on both; `sku-hot` is mixed (CPU
+  down, 487 to 106 ms, reads up, 1,534 to 9,940); the other four got
   slower.** The executed plans account for every read (their per-step buffer
   counts come from the plan-capture run, so totals can differ from the table
   by up to 1%):
@@ -1016,6 +1067,7 @@ ASSERT:s3b-stage3-lines:PASS
 ASSERT:s3b-stage<N>-plans-captured:PASS            (N = 0 to 3)
 ASSERT:s3b-stage<N>-executed-plan-matches:PASS
 ASSERT:s3b-stage<N>-measured:PASS
+ASSERT:s3b-stage<N>-purge-effective:PASS
 ASSERT:s3b-stage<N>-same-results:PASS
 ASSERT:s3b-stage<N>-normalizer-detects-change:PASS
 ASSERT:s3b-all-stages-same-results:PASS
@@ -1028,8 +1080,11 @@ ASSERT:s3b-teardown-clean:PASS
   order do not count), hashes the same as at stage 0, with the same count.
 - `plans-captured`: every statement's `explain()` gave a `sql_id`, generated
   SQL and a plan.
-- `executed-plan-matches`: every statement's `ALLSTATS LAST` plan has row and
-  buffer counts, and its plan hash equals the measured cursor's.
+- `executed-plan-matches`: every statement's and every control's `ALLSTATS
+  LAST` plan has row and buffer counts, and its plan hash equals the measured
+  cursor's.
+- `purge-effective`: after every purge, `v$sql` holds no cursor of that
+  `sql_id`, so the next run is parsed fresh.
 - `measured`: each measured `sql_id` (statements and controls) executed at
   least once per call, so the `v$sql` numbers belong to it.
 - `measure-copies-identical`: `61`, `64`, `66` and `68` have the same MD5.
@@ -1046,8 +1101,9 @@ Logical reads repeat within about 1% from run to run; CPU and elapsed time are
 noisy on this shared container, so read them as sizes, not exact values.
 
 The executed plans need two grants beyond the earlier ones, in
-`docker/init/01-lab-user.sql`: `SELECT` on `V_$SQL_PLAN_STATISTICS_ALL` and
-`V_$SQL_PLAN_STATISTICS`, and `EXECUTE` on `DBMS_SHARED_POOL`.
+`docker/init/01-lab-user.sql`: `SELECT` on `V_$SQL_PLAN_STATISTICS_ALL` (read
+by `dbms_xplan.display_cursor`) and `EXECUTE` on `DBMS_SHARED_POOL` (the
+purge).
 
 ### Writes (D): writes through views, knob 3, etags, and a materialized view (`scripts/70-writes.sql`, `scripts/71-writes-api.js`)
 
@@ -1075,7 +1131,10 @@ call, with their text) as `wr-vs-*` metrics and `PLAN` rows. CPU is at or
 below 1 centisecond for nearly every write here, so it does not separate them;
 reads and redo do. The executed plan of every measured statement is printed as
 `PLAN` rows. The figures are from two validator runs: a range ("21 to 24")
-means the runs differed, a single figure means they agreed.
+means the runs differed, a single figure means they agreed. The exception is
+the per-statement `v$sql` figures quoted in the text (gets per call of one
+statement, such as "730.7 gets per call"): those are from the first of the two
+runs only.
 
 **The indexes are not the same on both sides.** The collection has one index,
 on `_id`. The orders and lines tables have a primary key each and an index on
@@ -1108,8 +1167,9 @@ why. Writing through the view is the convenient path, not the cheap one, and
 the cost grows with the number of child rows.
 
 **2. Knob 3: change one line's qty in a 1,000-line order.** The document is
-38,952 bytes as JSON text and 24,406 bytes as stored OSON
-(`wr-k3-doc-oson-bytes`); its row holds only a 138-byte LOB locator, so the
+38,952 bytes as JSON text and 24,406 bytes as OSON
+(`wr-k3-doc-oson-bytes`, the document encoded again as OSON, not the stored
+LOB's length); its row holds only a 138-byte LOB locator, so the
 body is stored out of the row. Every run writes a new 3-digit value, so every
 change has the same length.
 
@@ -1153,13 +1213,17 @@ The duality view still changes only one line row, but the API's read with
 `FOR UPDATE` locks every row of the order. `70` measures that read alone in
 SQL, with its `COMMIT`:
 
-| `SELECT ... FOR UPDATE` of order 1 | Reads | Redo (bytes) | Undo records (one per locked row) |
+| `SELECT ... FOR UPDATE` of order 1 | Reads | Redo (bytes) | Undo records (about one per locked row) |
 |---|---|---|---|
 | collection | 8 | 548 | 1 |
 | duality view | 1,038 | 223,544 | 1,002 |
 
 On the view, the read locks the order row and all 1,000 line rows, and each
-lock writes redo: that is most of the API's redo for the view. Through SQL the
+lock writes redo: that is most of the API's redo for the view. That is 1,001
+locked rows and 1,002 undo records, so the count is about one per locked row,
+not exactly one; the extra record was not traced. The undo count is read from
+`v$transaction` before the `COMMIT`, inside the measured window, so the reads
+of that small query are part of both rows' figures. Through SQL the
 same change cost 29 reads and 588 bytes. The API's read-modify-write is
 the cost here, not the view. On the collection, the API writes about twice
 the redo of the SQL whole-document replace (54,120 against 27,444),
@@ -1301,7 +1365,15 @@ and `-gets-per-call`, `-vsql-gets-per-call`, `-vsql-cpu-us-per-call`,
 view update's recursive line update twice (once inside the view update's own
 gets), so the session figure is the one to quote. The undo-record count needs
 one more grant, in `docker/init/01-lab-user.sql`: `SELECT` on `V_$TRANSACTION`
-(the undo records of the open transaction).
+(the undo records of the open transaction). On a stack built before that grant
+was added, apply it as shown under "Grants on a stack that is already running"
+in How to run.
+
+Cursor purges are checked, not assumed: `wr-purge-failures` counts the purges
+that failed in `70` (0 when all worked), and `wr-api-<target>-purge-left`
+counts the target's cursors still in `v$sql` after the purge in `71` (0 when
+it worked). Neither is an assertion: the counts are taken as growth over a
+window, so a cursor that survives a purge does not change them.
 
 ## Teardown: `scripts/99-teardown.sql`
 
