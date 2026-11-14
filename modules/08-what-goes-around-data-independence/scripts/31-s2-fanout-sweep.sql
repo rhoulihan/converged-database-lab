@@ -32,7 +32,7 @@
 -- after its measurement) are recorded for the embedded update at N = 100 and 1000.
 -- CPU, elapsed and bytes in microseconds at every N, for all five statements
 -- (m08_meter.measure_us for the reads, measure_dml_us for the updates: purge,
--- warm-up, 20 runs, v$sql growth per run; each update run committed after the
+-- warm-up, 200 runs, v$sql growth per run; each update run committed after the
 -- statement). Each timed cursor must run the counted cursor's plan
 -- (s2c-us-same-plan). The crossover is also computed in CPU microseconds.
 
@@ -365,7 +365,7 @@ begin
     time_update;
   end if;
 
-  -- CPU microseconds, elapsed and bytes (v$sql, 20 runs). The reads keep the
+  -- CPU microseconds, elapsed and bytes (v$sql, 200 runs). The reads keep the
   -- counted text without gather_plan_statistics; each update alternates
   -- SILVER and GOLD from SILVER, so both models end on the same tier.
   for st in (select column_value stmt from table(sys.odcivarchar2list(
@@ -377,7 +377,7 @@ begin
     begin
       m08_meter.measure_us(pfx || '-' || st.stmt,
                            replace(read_sql(st.stmt, mk), 'gather_plan_statistics ', ''), mk,
-                           null, 20, p_allow_lob => st.stmt = 'embedded-read');
+                           null, 200, p_allow_lob => st.stmt = 'embedded-read');
     end;
   end loop;
   m08_meter.record(pfx || '-normalized-read-us',

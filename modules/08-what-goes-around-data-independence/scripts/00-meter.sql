@@ -87,7 +87,7 @@ CREATE OR REPLACE PACKAGE m08_meter AS
   -- must carry p_marker, and :id when p_bind is given. p_name at most 80 bytes.
   -- p_bytes => FALSE skips the -bytes row (when the script records it already).
   PROCEDURE measure_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
-                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 20,
+                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 200,
                        p_allow_lob BOOLEAN DEFAULT FALSE, p_bytes BOOLEAN DEFAULT TRUE);
   -- The same window for one DML statement that binds :t: purge
   -- (tmp:<p_name>-purge-left), one warm-up run with p_vals(1) and COMMIT,
@@ -95,7 +95,7 @@ CREATE OR REPLACE PACKAGE m08_meter AS
   -- followed by COMMIT (outside the statement, so not in its CPU), vs_end.
   -- The statement's CPU includes its undo and redo generation.
   PROCEDURE measure_dml_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
-                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 20);
+                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 200);
   -- Logical reads of one query's second execution (the first parses it), each
   -- fetching every row, less the meter's own overhead (measured in the call):
   -- records <p_name>-reads. Binds p_bind to :id when given.
@@ -478,7 +478,7 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
   END result_bytes;
 
   PROCEDURE measure_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
-                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 20,
+                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 200,
                        p_allow_lob BOOLEAN DEFAULT FALSE, p_bytes BOOLEAN DEFAULT TRUE) IS
     c   INTEGER;
     ids sys.odcivarchar2list;
@@ -517,7 +517,7 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
   END measure_us;
 
   PROCEDURE measure_dml_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
-                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 20) IS
+                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 200) IS
     ids sys.odcivarchar2list;
     tn  VARCHAR2(100) := CASE WHEN p_name LIKE 'tmp:%' THEN p_name ELSE 'tmp:' || p_name END;
   BEGIN
@@ -672,7 +672,7 @@ SELECT 'ASSERT:m08-meter-lob-guard-null-safe:' ||
             THEN 'PASS' ELSE 'FAIL' END
   FROM dual;
 
--- The v$sql helper: one marked query, 20 runs. CPU and elapsed are never
+-- The v$sql helper: one marked query, 200 runs (the default). CPU and elapsed are never
 -- negative, each run executed the query once, the purge left no cursor, and
 -- the bytes equal the result's text length computed in SQL.
 BEGIN

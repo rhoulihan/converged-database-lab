@@ -47,10 +47,9 @@
 -- statement: executions, rows, buffer gets and text) as METRIC and PLAN rows.
 --
 -- CPU and elapsed in microseconds per write (wr-<stmt>-us, -ela-us, and
--- v$sql's buffer gets, -gets): the growth of v$sql over the 20 counted runs,
--- for the write's own statements (its marker; the plain SQL inserts have two),
--- divided by 20. The window opens after the warm-up run and closes after the
--- last run; the COMMIT is not a statement in v$sql, so it is not in these
+-- v$sql's buffer gets, -gets): the growth of v$sql over 100 more runs after
+-- the 20 counted ones (m08d_h.c_cpu_runs), for the write's own statements (its
+-- marker; the plain SQL inserts have two), divided by 100. The COMMIT is not a statement in v$sql, so it is not in these
 -- figures, but the statement's undo and redo generation is. A duality view's
 -- or an MV log's recursive statements run inside the write and are part of
 -- its v$sql figures; the materialized view's refresh runs at COMMIT, so its
@@ -319,6 +318,11 @@ insert into m08_metrics (name, value)
 
 -- ===== Shared measuring helpers =====
 create or replace package m08d_h as
+  -- Extra runs per write for its v$sql CPU window. The session statistics
+  -- (reads, redo) are sampled on runs 1 to 20 as before; the CPU window then
+  -- covers the next c_cpu_runs runs, because v$sql CPU moves in steps of about
+  -- 1 ms per window (10 microseconds per run over 100 runs).
+  c_cpu_runs constant pls_integer := 100;
   -- The meter overhead recorded above (reads, redo).
   function ovr return number;
   function ovd return number;
@@ -612,7 +616,8 @@ create or replace procedure m08d_measure as
     return x;
   end;
 
-  -- One insert path, one k: 1 warm-up and 20 counted runs, each with its commit.
+  -- One insert path, one k: 1 warm-up, 20 counted runs and 100 CPU runs, each
+  -- with its commit.
   -- The markers of each write path's statements, for its v$sql window.
   function mk_of(p_stmt varchar2) return varchar2 is
   begin
@@ -631,8 +636,8 @@ create or replace procedure m08d_measure as
     id   number;
   begin
     bases(p_path || p_k) := base;
-    next_id := next_id + 21;
-    for r in 0 .. 20 loop
+    next_id := next_id + 21 + m08d_h.c_cpu_runs;
+    for r in 0 .. 20 + m08d_h.c_cpu_runs loop
       id := base + r;
       -- Everything the statement needs is built before the window opens.
       if p_path in ('col', 'dv') then
@@ -662,22 +667,20 @@ create or replace procedure m08d_measure as
         end loop;
       end if;
       commit;
-      m08d_h.sample('ins-' || p_path || '-k' || p_k, r);
-      if r = 0 then
-        m08_meter.vs_begin(mk_of('ins-' || p_path));
-        if p_path = 'dv' then m08d_h.vs_mark('ins-dv-k' || p_k); end if;
-      end if;
+      if r <= 20 then m08d_h.sample('ins-' || p_path || '-k' || p_k, r); end if;
+      if r = 0 and p_path = 'dv' then m08d_h.vs_mark('ins-dv-k' || p_k); end if;
+      if r = 20 then m08_meter.vs_begin(mk_of('ins-' || p_path)); end if;
     end loop;
-    m08_meter.vs_end('wr-ins-' || p_path || '-k' || p_k, mk_of('ins-' || p_path), 20);
+    m08_meter.vs_end('wr-ins-' || p_path || '-k' || p_k, mk_of('ins-' || p_path), m08d_h.c_cpu_runs);
     m08d_h.summarize('ins-' || p_path || '-k' || p_k);
   end;
 
   -- Knob 3: change line 1500's qty in order 1 (1,000 lines). Every run writes a
   -- new 3-digit value (col 100 + r, colpos 400 + r, colrep 500 + r, dv 200 + r,
-  -- sql 300 + r), so every run is a real change of the same length.
+  -- sql 300 + r, r up to 120), so every run is a real change of the same length.
   procedure knob3(p_path varchar2) is
   begin
-    for r in 0 .. 20 loop
+    for r in 0 .. 20 + m08d_h.c_cpu_runs loop
       if p_path = 'colrep' then
         -- The whole new document, built before the window opens.
         select json_transform(d.data, set '$.lines[499].qty' = 500 + r) into j
@@ -707,13 +710,11 @@ create or replace procedure m08d_measure as
       end if;
       n := sql%rowcount;
       commit;
-      m08d_h.sample('k3-' || p_path, r);
-      if r = 0 then
-        m08_meter.vs_begin(mk_of('k3-' || p_path));
-        if p_path = 'dv' then m08d_h.vs_mark('k3-dv'); end if;
-      end if;
+      if r <= 20 then m08d_h.sample('k3-' || p_path, r); end if;
+      if r = 0 and p_path = 'dv' then m08d_h.vs_mark('k3-dv'); end if;
+      if r = 20 then m08_meter.vs_begin(mk_of('k3-' || p_path)); end if;
     end loop;
-    m08_meter.vs_end('wr-k3-' || p_path, mk_of('k3-' || p_path), 20);
+    m08_meter.vs_end('wr-k3-' || p_path, mk_of('k3-' || p_path), m08d_h.c_cpu_runs);
     m08_meter.record('wr-k3-' || p_path || '-rows', n);
     m08d_h.summarize('k3-' || p_path);
   end;
@@ -722,7 +723,7 @@ create or replace procedure m08d_measure as
   -- COMMIT, the transaction's undo records are read: one per locked row.
   procedure for_update(p_what varchar2) is
   begin
-    for r in 0 .. 20 loop
+    for r in 0 .. 20 + m08d_h.c_cpu_runs loop
       m08_meter.snap;
       if p_what = 'col' then
         select /*+ gather_plan_statistics M08DXFUC */ d.data into j
@@ -739,10 +740,10 @@ create or replace procedure m08d_measure as
         when no_data_found then urec := 0;
       end;
       commit;
-      m08d_h.sample('fu-' || p_what, r);
-      if r = 0 then m08_meter.vs_begin(mk_of('fu-' || p_what)); end if;
+      if r <= 20 then m08d_h.sample('fu-' || p_what, r); end if;
+      if r = 20 then m08_meter.vs_begin(mk_of('fu-' || p_what)); end if;
     end loop;
-    m08_meter.vs_end('wr-fu-' || p_what, mk_of('fu-' || p_what), 20);
+    m08_meter.vs_end('wr-fu-' || p_what, mk_of('fu-' || p_what), m08d_h.c_cpu_runs);
     m08_meter.record('wr-fu-' || p_what || '-undo-records', urec);
     m08d_h.summarize('fu-' || p_what);
   end;
@@ -757,7 +758,7 @@ begin
     insert_path('col', k.k);
     m08d_h.vs_snap('ins-dv-k' || k.k, '"' || sys_context('userenv', 'current_schema') || '"\."M08D_');
     insert_path('dv', k.k);
-    m08d_h.vs_done('ins-dv-k' || k.k, 21);
+    m08d_h.vs_done('ins-dv-k' || k.k, 21 + m08d_h.c_cpu_runs);
     insert_path('sql', k.k);
     insert_path('sqlrow', k.k);
   end loop;
@@ -795,9 +796,10 @@ begin
   knob3('colrep');
   m08d_h.vs_snap('k3-dv', '"' || sys_context('userenv', 'current_schema') || '"\."M08D_');
   knob3('dv');
-  m08d_h.vs_done('k3-dv', 21);
+  m08d_h.vs_done('k3-dv', 21 + m08d_h.c_cpu_runs);
   -- After the duality-view update, the change is in the line row.
-  m08_meter.record('tmp:wr-k3-dv-in-table', case when qty_tab(1500) = 220 then 1 else 0 end);
+  m08_meter.record('tmp:wr-k3-dv-in-table',
+                   case when qty_tab(1500) = 220 + m08d_h.c_cpu_runs then 1 else 0 end);
   knob3('sql');
   for_update('col');
   for_update('dv');
@@ -815,7 +817,9 @@ begin
   select count(*) into v2 from m08d_ord_dv d, json_table(d.data, '$.lines[*]' columns (x number path '$.lineId')) jt
    where d.data."_id" = 1;
   m08_meter.record('tmp:wr-k3-visible',
-                   case when qty_col(1500) = 520 and qty_dv(1500) = 320 and qty_tab(1500) = 320
+                   case when qty_col(1500) = 520 + m08d_h.c_cpu_runs
+                         and qty_dv(1500) = 320 + m08d_h.c_cpu_runs
+                         and qty_tab(1500) = 320 + m08d_h.c_cpu_runs
                          and qty_col(1499) = v1 and qty_dv(1499) = v1 and qty_tab(1499) = v1
                          and n = 1000 and v2 = 1000
                         then 1 else 0 end);
@@ -914,7 +918,8 @@ create or replace procedure m08d_measure_mv(p_phase number) as
   nref number := 0;
   t    varchar2(10);
 
-  -- One tier change on customer 1 plus COMMIT, 1 warm-up and 20 counted runs.
+  -- One tier change on customer 1 plus COMMIT, 1 warm-up, 20 counted runs and
+  -- 100 CPU runs.
   -- The tiers alternate, so every run is a real change. Phase 1 starts from
   -- BRONZE and ends on SILVER; phase 2 (offset 1) starts with GOLD, so its
   -- first run already differs from the MV's starting content, and ends on GOLD.
@@ -922,7 +927,7 @@ create or replace procedure m08d_measure_mv(p_phase number) as
   -- of customer 1's rows.
   procedure tier_change(p_stmt varchar2, p_off number) is
   begin
-    for r in 0 .. 20 loop
+    for r in 0 .. 20 + m08d_h.c_cpu_runs loop
       t := case mod(r + p_off, 2) when 0 then 'SILVER' else 'GOLD' end;
       m08_meter.snap;
       if p_stmt = 'mv-upd-embedded' then
@@ -938,10 +943,10 @@ create or replace procedure m08d_measure_mv(p_phase number) as
       end if;
       n := sql%rowcount;
       commit;
-      m08d_h.sample(p_stmt, r);
-      if r = 0 then
+      if r <= 20 then m08d_h.sample(p_stmt, r); end if;
+      if r = 0 and p_stmt = 'mv-upd-mv' then m08d_h.vs_mark('mv-refresh'); end if;
+      if r = 20 then
         m08_meter.vs_begin(case p_stmt when 'mv-upd-embedded' then 'M08DXMUE' else 'M08DXMU' end);
-        if p_stmt = 'mv-upd-mv' then m08d_h.vs_mark('mv-refresh'); end if;
       end if;
       if p_stmt = 'mv-upd-mv' then
         execute immediate 'select count(*) from m08d_ord_cust_mv where cust_id = 1 and tier = :1'
@@ -950,7 +955,8 @@ create or replace procedure m08d_measure_mv(p_phase number) as
       end if;
     end loop;
     m08_meter.record('wr-' || p_stmt || '-rows', n);
-    m08_meter.vs_end('wr-' || p_stmt, case p_stmt when 'mv-upd-embedded' then 'M08DXMUE' else 'M08DXMU' end, 20);
+    m08_meter.vs_end('wr-' || p_stmt, case p_stmt when 'mv-upd-embedded' then 'M08DXMUE' else 'M08DXMU' end,
+                     m08d_h.c_cpu_runs);
     m08d_h.summarize(p_stmt);
   end;
 begin
@@ -965,6 +971,15 @@ begin
       || ' from m08d_cord o join m08d_cust c on c.id = o.cust_id where o.id = 201', 20);
     m08d_h.capture('mv-read-embedded', 'M08DXMRE');
     m08d_h.capture('mv-read-normalized', 'M08DXMRN');
+    -- CPU, elapsed and bytes of the two reads (v$sql, 200 runs), with their own
+    -- markers and without gather_plan_statistics.
+    m08_meter.measure_us('wr-mv-read-embedded',
+      'select /*+ M08DXTMRE */ json_serialize(d.data returning blob)'
+      || ' from m08d_emb d where d.data."_id" = 201', 'M08DXTMRE', p_allow_lob => true);
+    m08_meter.measure_us('wr-mv-read-normalized',
+      'select /*+ index(o m08d_cord_pk) index(c m08d_cust_pk) M08DXTMRN */'
+      || ' o.id, o.status, o.total, c.id, c.name, c.tier'
+      || ' from m08d_cord o join m08d_cust c on c.id = o.cust_id where o.id = 201', 'M08DXTMRN');
     tier_change('mv-upd-embedded', 0);
     m08d_h.capture('mv-upd-embedded', 'M08DXMUE');
     tier_change('mv-upd-normalized', 0);
@@ -974,9 +989,12 @@ begin
       'select /*+ gather_plan_statistics M08DXMRM */ m.id, m.status, m.total, m.cust_id, m.name, m.tier'
       || ' from m08d_ord_cust_mv m where m.id = 201', 20);
     m08d_h.capture('mv-read-mv', 'M08DXMRM');
+    m08_meter.measure_us('wr-mv-read-mv',
+      'select /*+ M08DXTMRM */ m.id, m.status, m.total, m.cust_id, m.name, m.tier'
+      || ' from m08d_ord_cust_mv m where m.id = 201', 'M08DXTMRM');
     m08d_h.vs_snap('mv-refresh', '"(M08D_ORD_CUST_MV|MLOG\$_M08D_[A-Z_]+)"');
     tier_change('mv-upd-mv', 1);
-    m08d_h.vs_done('mv-refresh', 21);
+    m08d_h.vs_done('mv-refresh', 21 + m08d_h.c_cpu_runs);
     m08_meter.record('tmp:wr-mv-refreshed-runs', nref);
     -- The tier change's CPU with its refresh: the update statement (its MV log
     -- insert is recursive inside it) plus every statement the COMMIT runs for
@@ -1133,13 +1151,13 @@ select 'ASSERT:wr-s4d-etag-controls:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- The MV refreshes at every COMMIT: it started at SILVER, every one of the 21
+-- The MV refreshes at every COMMIT: it started at SILVER, every one of the 121
 -- phase-2 commits showed its new tier on all 100 MV rows, and after the last
 -- (GOLD) the MV matches the tables. Each arm changed the expected rows.
 select 'ASSERT:wr-mv-reflects-commit:' ||
        case when (select value from m08_metrics where name = 'tmp:wr-mv-reflects') = 1
              and (select value from m08_metrics where name = 'tmp:wr-mv-start-silver') = 100
-             and (select value from m08_metrics where name = 'tmp:wr-mv-refreshed-runs') = 21
+             and (select value from m08_metrics where name = 'tmp:wr-mv-refreshed-runs') = 121
              and (select value from m08_metrics where name = 'tmp:wr-mv-mode-ok') = 1
              and (select count(*) from m08_metrics
                    where name like 'tmp:wr-mv-upd-%-runs' and value = 20) = 3
@@ -1172,13 +1190,14 @@ select 'ASSERT:wr-plans-captured:' ||
 -- run (at least once per call) and the purges left no marked cursor.
 select 'ASSERT:wr-us-measured:' ||
        case when (select count(*) from m08_metrics
-                   where name like 'tmp:wr-%-execs-per-call' and value >= 1) = 18
+                   where name like 'tmp:wr-%-execs-per-call' and value >= 1) = 21
             then 'PASS' else 'FAIL' end
   from dual;
 
 select 'ASSERT:wr-us-purge-effective:' ||
        case when (select count(*) from m08_metrics where name like 'tmp:wr-us-purge-left-%') = 2
              and (select count(*) from m08_metrics where name like 'tmp:wr-us-purge-left-%' and value <> 0) = 0
+             and (select count(*) from m08_metrics where name like 'tmp:wr-mv-read-%-purge-left' and value = 0) = 3
             then 'PASS' else 'FAIL' end
   from dual;
 

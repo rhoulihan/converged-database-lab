@@ -36,12 +36,10 @@
 --           cluster above suits orders of about 10 lines; a larger order
 --           chains blocks onto its key. So there is one more hash cluster per
 --           k, SIZE computed from the bytes of the k-line order (plus 10%,
---           rounded up to 256 bytes, at most 8192), holding that k's 20
---           target orders only, with HASHKEYS 1000 (spare keys, so targets
---           rarely share a key). This is the hash design's best case at each
---           k: every key is sized for the orders it holds. (Loading the full
---           data into the k = 100 and k = 1000 clusters took about two and a
---           half minutes per run, so the full-data case is left to hash.)
+--           rounded up to 256 bytes, at most 8192), holding the full data
+--           (every order and line, the lines in the same interleaved order)
+--           with HASHKEYS 22000, as for hash. At k = 1000 the cap holds about
+--           a quarter of the order (31,915 bytes), so it still chains blocks.
 --   hdv   : a duality view over that k-sized hash cluster's two tables
 --   hdoc  : the order document in a single-table hash cluster keyed by order
 --           id, read by key and serialized like doc. On this build a
@@ -50,10 +48,11 @@
 --           FORMAT OSON), the largest binary column a cluster accepts. Only
 --           orders whose OSON fits in 2,000 bytes can be stored: the k = 1 and
 --           k = 10 targets (and the 10-line fillers); a 100-line order does
---           not fit. One such cluster per k (k = 1 and 10), sized and loaded
---           as for hashk (the 20 targets, HASHKEYS 1000).
+--           not fit. One such cluster per k (k = 1 and 10), sized as for
+--           hashk, holding every order document that fits (all but the
+--           k = 100 and k = 1000 targets), HASHKEYS 22000.
 -- CPU, elapsed and bytes per reader: m08_meter.measure_us (v$sql growth over
--- 20 runs, microseconds; see 00-meter.sql), for every target.
+-- 100 runs, microseconds; see 00-meter.sql), for every target.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop view if exists m08a_i_dv;
@@ -275,12 +274,11 @@ insert into m08_metrics (name, value)
 -- ===== Fairness arms: hash clusters sized for each k =====
 -- For each k: the bytes of target 1 (its order row and its line rows, from
 -- vsize plus a few bytes of row overhead), plus 10%, rounded up to 256 bytes,
--- at most 8192 (one block). One cluster per k, HASHKEYS 1000, holding the 20
--- target orders of that k (their order rows and line rows, the lines in the
--- same interleaved order), and a duality view over its two tables. Then, for
--- k = 1 and 10, a single-table hash cluster holding the 20 target documents
--- of that k (each fits in 2,000 bytes of OSON), sized from target 1's OSON
--- bytes the same way.
+-- at most 8192 (one block). One cluster per k, HASHKEYS 22000, holding the
+-- full data (every order row and line row, the lines in the same interleaved
+-- order), and a duality view over its two tables. Then, for k = 1 and 10, a
+-- single-table hash cluster holding every order document whose OSON fits in
+-- 2,000 bytes, sized from target 1's OSON bytes the same way.
 DECLARE
   sz NUMBER;
   ob NUMBER;
@@ -296,21 +294,21 @@ BEGIN
     m08_meter.record('s1a-k' || t.k || '-order-bytes', sz);
     sz := LEAST(8192, CEIL(1.1 * sz / 256) * 256);
     m08_meter.record('s1a-hashk-k' || t.k || '-size', sz);
-    ddl('create cluster m08a_hk' || t.k || ' (order_id number) size ' || sz || ' hashkeys 1000');
+    ddl('create cluster m08a_hk' || t.k || ' (order_id number) size ' || sz || ' hashkeys 22000');
     ddl('create table m08a_hk' || t.k || '_ord (id number primary key, customer varchar2(40),'
         || ' status varchar2(12)) cluster m08a_hk' || t.k || ' (id)');
     ddl('create table m08a_hk' || t.k || '_line (line_id varchar2(36) primary key,'
         || ' order_id number not null references m08a_hk' || t.k || '_ord, sku varchar2(20),'
         || ' qty number) cluster m08a_hk' || t.k || ' (order_id)');
     ddl('insert into m08a_hk' || t.k || '_ord (id, customer, status)'
-        || ' select id, customer, status from m08a_ord'
-        || ' where id in (select id from m08a_targets where k = ' || t.k || ')');
+        || ' select id, customer, status from m08a_ord');
     ddl('insert into m08a_hk' || t.k || '_line (line_id, order_id, sku, qty)'
         || ' select ''L'' || order_id || ''-'' || n, order_id,'
         || ' ''SKU-'' || lpad(mod(order_id * 7 + n, 5000), 4, ''0''), mod(n, 5) + 1'
-        || ' from m08a_line_plan where order_id in (select id from m08a_targets where k = ' || t.k || ')'
-        || ' order by phase, pos1, pos2');
+        || ' from m08a_line_plan order by phase, pos1, pos2');
     COMMIT;
+    EXECUTE IMMEDIATE 'select count(*) from m08a_hk' || t.k || '_ord' INTO ob;
+    m08_meter.record('s1a-hashk-k' || t.k || '-orders', ob);
     ddl('create json relational duality view m08a_hk' || t.k || '_dv as'
         || ' select json {''_id'' : o.id, ''customer'' : o.customer, ''status'' : o.status,'
         || ' ''lines'' : [select json {''lineId'' : l.line_id, ''sku'' : l.sku, ''qty'' : l.qty}'
@@ -335,7 +333,7 @@ BEGIN
       sz := LEAST(8192, CEIL(1.1 * (ob + 20) / 256) * 256);
       m08_meter.record('s1a-hdoc-k' || t.k || '-size', sz);
       ddl('create cluster m08a_hd' || t.k || ' (order_id number) size ' || sz
-          || ' single table hashkeys 1000');
+          || ' single table hashkeys 22000');
       ddl('create table m08a_hd' || t.k || '_doc (order_id number primary key,'
           || ' doc raw(2000) check (doc is json format oson)) cluster m08a_hd' || t.k || ' (order_id)');
       ddl('insert into m08a_hd' || t.k || '_doc (order_id, doc)'
@@ -347,9 +345,11 @@ BEGIN
           || '                               order by l.line_id returning json)'
           || '                          from m08a_h_line l where l.order_id = o.id)'
           || '         returning blob format oson) b'
-          || '    from m08a_ord o where o.id in (select id from m08a_targets where k = ' || t.k || '))'
+          || '    from m08a_ord o)'
           || ' where dbms_lob.getlength(b) <= 2000');
       COMMIT;
+      EXECUTE IMMEDIATE 'select count(*) from m08a_hd' || t.k || '_doc' INTO ob;
+      m08_meter.record('s1a-hdoc-k' || t.k || '-docs', ob);
     END IF;
   END LOOP;
 END;
@@ -521,7 +521,7 @@ END;
 -- ===== Measurement: 20 targets per k, every reader =====
 -- For each reader, k and target: logical reads of the second execution
 -- (m08_meter.measure_reads), then CPU, elapsed and bytes
--- (m08_meter.measure_us: purge, warm-up, 20 runs, v$sql growth per run). Each
+-- (m08_meter.measure_us: purge, warm-up, 100 runs, v$sql growth per run). Each
 -- reader binds the order id, so every target is parsed for its own id. Right
 -- after each CPU window, the cursor's plan is checked for the reader's access
 -- path (tmp:...-planok). Values per target stay in tmp rows; the summary
@@ -622,7 +622,7 @@ BEGIN
       nm  := 'tmp:s1a-' || rdrs(i) || '-k' || t.k || '-t' || t.j;
       lob := rdrs(i) IN ('doc', 'dv', 'hdv', 'hdoc');
       m08_meter.measure_reads(nm, rsql(rdrs(i), t.k, 'R'), t.id, lob);
-      m08_meter.measure_us(nm, rsql(rdrs(i), t.k, 'T'), 'M08AT' || upper(rdrs(i)), t.id, 20, lob);
+      m08_meter.measure_us(nm, rsql(rdrs(i), t.k, 'T'), 'M08AT' || upper(rdrs(i)), t.id, 100, lob);
       m08_meter.record(nm || '-planok', plan_ok(rdrs(i), t.k));
     END LOOP;
   END LOOP;
@@ -794,6 +794,14 @@ end;
 
 select 'ASSERT:s1a-same-content-new-arms:' ||
        case when (select value from m08_metrics where name = 'tmp:s1a-arms-same-content') = 1
+             -- the arms hold the full population: every order in each k-sized
+             -- cluster, every order but the 40 large targets in each document cluster
+             and (select count(*) from m08_metrics
+                   where name like 's1a-hashk-k%-orders'
+                     and value = (select value from m08_metrics where name = 's1a-orders')) = 4
+             and (select count(*) from m08_metrics
+                   where name like 's1a-hdoc-k%-docs'
+                     and value = (select value from m08_metrics where name = 's1a-orders') - 40) = 2
             then 'PASS' else 'FAIL' end
   from dual;
 
@@ -915,7 +923,7 @@ select 'METRIC:' || name || ':' || to_char(value, 'FM999999990')
         or name like '%-cpu-cs-median' or name like '%-cpu-cs-max'
         or name like '%-elapsed-cs-median' or name like '%-elapsed-cs-max'
         or name like '%-us' or name like '%-bytes' or name like '%-t20-%'
-        or name like '%-size' or name = 's1a-orders')
+        or name like '%-size' or name = 's1a-orders' or name like '%-orders' or name like '%-docs')
  order by name;
 
 -- ===== Teardown =====

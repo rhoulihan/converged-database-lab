@@ -292,8 +292,8 @@ END;
 
 -- ===== Measurement: CPU, elapsed and bytes (v$sql, microseconds) =====
 -- m08_meter.measure_us, per reader and target: purge the reader's cursor, one
--- warm-up run, 20 runs fetching every row, the growth of v$sql over the 20
--- runs divided by 20 (CPU and elapsed in microseconds, buffer gets), and the
+-- warm-up run, 200 runs fetching every row, the growth of v$sql over the 200
+-- runs divided by 200 (CPU and elapsed in microseconds, buffer gets), and the
 -- bytes one run returns. Each reader has its own marker and binds the order
 -- id, so every target is parsed for its own id.
 DECLARE
@@ -308,21 +308,21 @@ BEGIN
   FOR i IN 1 .. ids.COUNT LOOP
     m08_meter.measure_us('s1-doc-' || lay(i) || '-k' || ks(i),
       'select /*+ M08S1TDOC */ json_serialize(d.data returning blob) from m08_ord_doc d'
-      || ' where d.data."_id" = :id', 'M08S1TDOC', ids(i), 20, p_allow_lob => TRUE);
+      || ' where d.data."_id" = :id', 'M08S1TDOC', ids(i), 200, p_allow_lob => TRUE);
     m08_meter.measure_us('s1-join-' || lay(i) || '-k' || ks(i),
       'select /*+ M08S1TJOIN */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
       || ' from m08_ord o join m08_line l on l.order_id = o.id where o.id = :id',
-      'M08S1TJOIN', ids(i), 20);
+      'M08S1TJOIN', ids(i), 200);
     -- Sensitivity probe: the same document returned as OSON (binary JSON, as
     -- a driver that reads the JSON type receives it) instead of serialized
     -- to text. Its CPU shows how much of the doc reader's CPU is the text
     -- serialization.
     m08_meter.measure_us('s1-doc-oson-' || lay(i) || '-k' || ks(i),
       'select /*+ M08S1TDOCO */ json_query(d.data, ''$'' returning blob format oson)'
-      || ' from m08_ord_doc d where d.data."_id" = :id', 'M08S1TDOCO', ids(i), 20, p_allow_lob => TRUE);
+      || ' from m08_ord_doc d where d.data."_id" = :id', 'M08S1TDOCO', ids(i), 200, p_allow_lob => TRUE);
     m08_meter.measure_us('s1-dv-' || lay(i) || '-k' || ks(i),
       'select /*+ M08S1TDV */ json_serialize(d.data returning blob) from m08_ord_dv d'
-      || ' where d.data."_id" = :id', 'M08S1TDV', ids(i), 20, p_allow_lob => TRUE);
+      || ' where d.data."_id" = :id', 'M08S1TDV', ids(i), 200, p_allow_lob => TRUE);
     -- Each timed cursor, parsed for this target: an INDEX step and no full scan.
     FOR m IN (SELECT column_value mk, column_value || '-' || lay(i) || '-k' || ks(i) nm
                 FROM TABLE(sys.odcivarchar2list('M08S1TDOC', 'M08S1TJOIN', 'M08S1TDV'))) LOOP
@@ -381,10 +381,10 @@ BEGIN
     m08_meter.record('tmp:' || nm || '-purge-left', m08_meter.vs_purge(mk));
     q(ids(i), ks(i));                        -- warm-up
     m08_meter.vs_begin(mk);
-    FOR r IN 1 .. 20 LOOP
+    FOR r IN 1 .. 200 LOOP
       q(ids(i), ks(i));
     END LOOP;
-    m08_meter.vs_end(nm, mk, 20);
+    m08_meter.vs_end(nm, mk, 200);
     m08_meter.record(nm || '-bytes', b);
   END LOOP;
 END;

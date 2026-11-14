@@ -32,7 +32,7 @@
 -- (m08_meter.measure_repeat, 20 runs, 1 cs resolution) are recorded for the
 -- item readers at M = 100 and 500.
 -- CPU, elapsed and bytes at every point (m08_meter.measure_us: purge, warm-up,
--- 20 runs, v$sql growth per run in microseconds): every item reader at every M
+-- 200 runs, v$sql growth per run in microseconds): every item reader at every M
 -- and the doc and join reads, each with its own marker (M08C1U...). Its plan
 -- hash must equal the counted cursor's (s1c-us-same-plan). The crossover is
 -- also computed in CPU microseconds (...-crossover-...-us), each side the
@@ -330,11 +330,11 @@ begin
     m08_meter.record('tmp:' || pfx || '-m' || ms(i) || '-same-content', same_content(ms(i)));
   end loop;
 
-  -- CPU microseconds, elapsed and bytes at every point (v$sql, 20 runs).
+  -- CPU microseconds, elapsed and bytes at every point (v$sql, 200 runs).
   -- The doc's bytes are already recorded above (-doc-bytes), so not again.
   m08_meter.measure_us(pfx || '-doc',
     'select /*+ M08C1UDOCK' || p_k || ' */ json_serialize(d.data returning blob) from m08c1_ord_doc d'
-    || ' where d.data."_id" = 900001', 'M08C1UDOCK' || p_k, null, 20, p_allow_lob => true,
+    || ' where d.data."_id" = 900001', 'M08C1UDOCK' || p_k, null, 200, p_allow_lob => true,
     p_bytes => false);
   m08_meter.measure_us(pfx || '-join',
     'select /*+ M08C1UJOINK' || p_k || ' */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
@@ -349,7 +349,7 @@ begin
                                                    else 'ODS' end || 'K' || p_k || 'M' || ms(i);
       begin
         m08_meter.measure_us(pfx || '-m' || ms(i) || '-' || rd.rdr, item_sql(rd.rdr, ms(i), mk, false),
-                             mk, null, 20, p_allow_lob => rd.rdr = 'orderdocs-serialized');
+                             mk, null, 200, p_allow_lob => rd.rdr = 'orderdocs-serialized');
       end;
     end loop;
     m08_meter.record(pfx || '-m' || ms(i) || '-orderdocs-us',

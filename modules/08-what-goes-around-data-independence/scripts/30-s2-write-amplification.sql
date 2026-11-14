@@ -32,7 +32,7 @@
 -- crossover; it makes the write side worse still for embedding.
 -- The same crossover is computed in CPU microseconds per statement
 -- (s2-crossover-updates-per-1000-reads-us), from m08_meter.measure_us (reads:
--- purge, warm-up, 20 runs, v$sql growth per run) and m08_meter.measure_dml_us
+-- purge, warm-up, 200 runs, v$sql growth per run) and m08_meter.measure_dml_us
 -- (updates: the same window, each run committed after the statement; the
 -- update's CPU includes its undo and redo generation). Each side's read is
 -- the cheaper of its readers in CPU.
@@ -294,12 +294,12 @@ begin
   -- run, and both end on the same tier.
   m08_meter.measure_us('s2-embedded-read',
     'select /*+ M08SXTER */ json_serialize(d.data returning blob) from m08s2_ord_doc d'
-    || ' where d.data."_id" = 201', 'M08SXTER', null, 20, p_allow_lob => true);
+    || ' where d.data."_id" = 201', 'M08SXTER', null, 200, p_allow_lob => true);
   -- Sensitivity probe: the embedded document returned as OSON (binary JSON)
   -- instead of serialized to text.
   m08_meter.measure_us('s2-embedded-read-oson',
     'select /*+ M08SXTERO */ json_query(d.data, ''$'' returning blob format oson) from m08s2_ord_doc d'
-    || ' where d.data."_id" = 201', 'M08SXTERO', null, 20, p_allow_lob => true);
+    || ' where d.data."_id" = 201', 'M08SXTERO', null, 200, p_allow_lob => true);
   m08_meter.measure_us('s2-normalized-read-pk',
     'select /*+ index(o m08s2_ord_pk) index(c m08s2_cust_pk) M08SXTNR */'
     || ' o.id, o.status, o.total, c.id, c.name, c.tier'

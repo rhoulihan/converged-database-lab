@@ -39,7 +39,7 @@
 
 -- CPU, elapsed and bytes (m08b_time, after each k's reads): every reader
 -- again through m08_meter.measure_us, with its own marker (M08KIDT...): purge,
--- warm-up, 20 runs, the growth of v$sql per run in microseconds, and the bytes
+-- warm-up, 200 runs, the growth of v$sql per run in microseconds, and the bytes
 -- one run returns. The same crossover is then computed in CPU microseconds
 -- (s1b-crossover-...-k<k>-us), each side again the cheaper of its two readers,
 -- this time in CPU.
@@ -343,7 +343,7 @@ create or replace procedure m08b_time(p_k number) as
   ok number;
   procedure t(p_rdr varchar2, p_mk varchar2, p_sql varchar2, p_lob boolean default false) is
   begin
-    m08_meter.measure_us('s1b-' || p_rdr || '-k' || p_k, p_sql, p_mk, null, 20, p_lob);
+    m08_meter.measure_us('s1b-' || p_rdr || '-k' || p_k, p_sql, p_mk, null, 200, p_lob);
   end;
   function v(p_name varchar2) return number is
     x number;
