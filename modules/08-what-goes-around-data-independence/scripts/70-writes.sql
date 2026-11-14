@@ -1115,7 +1115,8 @@ select 'ASSERT:wr-insert-same-content:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- Knob 3: each path changed one row or document in each of 20 runs, the last
+-- Knob 3: each path ran 121 times (warm-up, 20 counted, 100 CPU runs) with 20
+-- counted samples, its last run changed one row or document, the last
 -- change is visible in every read (collection, view, table), the neighbouring
 -- line is untouched, the view update landed in the line row, and the
 -- positional path addressed the same line.

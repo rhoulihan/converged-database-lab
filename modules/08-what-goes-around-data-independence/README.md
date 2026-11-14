@@ -39,15 +39,15 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | Scenario | Script(s) | Statement it tests | What it shows |
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
-| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time (microseconds from `v$sql`), the join uses less than the serialized document at 1 line in both layouts and at 10 lines clustered; the two are not separated at 10 lines interleaved and 100 lines clustered; the document uses less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 7 to 11 microseconds at every size. The duality view is a join and costs the most CPU. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
-| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, all on the same full data, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3), and the document does the fewest reads at 1,000 lines (8). In CPU the joins are not separated from the serialized document up to 10 lines (they take less in elapsed time); the hash clusters use less at 100 lines, and the covering index, both IOTs and the sized hash cluster at 1,000 lines.** With 20 large orders growing at once, the fixed-size clusters fall far behind in reads at 1,000 lines (64 and 118). |
-| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 42 to 250; in CPU there is none at 10 lines (the normalized tables use less CPU for both queries), the order reads are not separated at 100 lines, and at 1,000 lines it is about 5.** |
+| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time (microseconds from `v$sql`), the join and the serialized document are not separated at 1 and 10 lines in either layout or at 100 lines clustered (in elapsed time the join takes less at 1 and 10 lines); the document uses less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 7 to 9 microseconds at every size. The duality view is a join and costs the most CPU. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, all on the same full data, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3), and the document does the fewest reads at 1,000 lines (8). In CPU the joins are not separated from the serialized document up to 10 lines (they take less in elapsed time); the sized hash cluster uses less at 100 lines (the other co-located joins take less there only in elapsed time), and the covering index, both IOTs and the sized hash cluster at 1,000 lines.** With 20 large orders growing at once, the fixed-size clusters fall far behind in reads at 1,000 lines (64 and 118). |
+| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 42 to 250; in CPU the order reads are not separated at 10 and 100 lines, so no crossover is stated there, and at 1,000 lines it is about 4 to 6.** |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance: **0.9 tier changes per 1,000 order reads in logical reads, and no crossover in CPU, where the join read uses less CPU than the embedded read (3 against 10 microseconds).** |
-| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: in logical reads each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant, and a crossover exists at every point. In CPU there is no crossover at any point of the S2 sweep; in the S1b sweep the order reads are not separated at 100 lines, and at 1,000 lines the crossover exists at every M, 6 to 12 times lower than in logical reads.** |
+| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: in logical reads each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant, and a crossover exists at every point. In CPU there is no crossover at any point of the S2 sweep; in the S1b sweep the order reads are not separated at 100 lines, and at 1,000 lines the crossover exists at every M, 6 to 16 times lower than in logical reads.** |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
 | S3 at scale (B) | `60` to `69` | "there is no data independence", and the objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3 compared with stage 2). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
-| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and no less in reads (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. In CPU (microseconds from `v$sql`), the one-line change through the duality view costs about 150 to 300 times the row update, though it writes the same redo. |
+| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and no less in reads (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. In CPU (microseconds from `v$sql`), the one-line change through the duality view costs about 160 to 310 times the row update, though it writes the same redo. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -198,13 +198,22 @@ internal statements). They leave out the client and the network.
 **Resolution.** On this stack `CPU_TIME` in `v$sql` moves in steps of about one
 millisecond (the operating system's CPU accounting). A call shorter than that
 usually shows CPU equal to its elapsed time to the microsecond; a longer call
-shows CPU up to about a millisecond above or below its elapsed time. Over a
-window the error stays about one millisecond in total, so per run it is about
-1,000 / R microseconds: 5 at R = 200, 10 at R = 100. For short statements the
-`-us` figure is therefore in effect database-side elapsed time. Two readers
-are ranked in CPU only when their gap is larger than one step plus the
-run-to-run spread; otherwise the text says "not separated". The tables give
-ranges over two validator runs on the current scripts.
+shows CPU up to about a millisecond above or below its elapsed time. For a
+window over one short statement the error stays about one millisecond in
+total, so per run it is about 1,000 / R microseconds: 5 at R = 200, 10 at
+R = 100. That is the step used below. Windows over longer calls, or over many
+statements per run, can be off by a few milliseconds in total (the
+record-at-a-time reader at 100 and 1,000 lines, and the one-line change
+through the duality view, which takes about 3 ms per call); none of those
+feeds a close ranking. For short statements the `-us` figure is therefore in
+effect database-side elapsed time. Two readers are ranked in CPU only when the
+gap between their ranges is larger than one step; the ranges already hold the
+run-to-run spread. Otherwise the text says "not separated".
+
+**Which runs.** Every figure in this README is from four validator runs on
+these scripts, in November 2026: three back to back and one on a freshly built
+database. A range ("21 to 24") means the runs differed; a single figure means
+all four agreed.
 
 A note on the document readers. They serialize the document to JSON text,
 which is what a client that asks for text receives. That serialization is CPU
@@ -312,39 +321,40 @@ really read; a client fetch costs the same.
 elapsed microseconds per read from `v$sql`, and the bytes one read returns.
 "doc as OSON" is a sensitivity probe: the same document returned as binary
 JSON (OSON, what a driver that reads the JSON type receives) instead of text.
-Logical reads are the second-execution reads; CPU is a range over the two
-validator runs on the current scripts.
+Logical reads are the second-execution reads; every cell is a range over the
+four runs.
 
 | layout | k | doc: reads / CPU us | doc as OSON: CPU us | join: reads / CPU us | dv: reads / CPU us | n1: reads / CPU us | bytes, doc / join |
 |---|---|---|---|---|---|---|---|
-| clustered | 1 | 3 / 9 | 7 to 10 | 7 / 3 to 4 | 7 / 19 to 20 | 11 / 5 to 6 | 112 / 38 |
-| clustered | 10 | 3 / 12 | 7 | 7 / 6 | 7 / 34 | 47 / 25 to 30 | 544 / 380 |
-| clustered | 100 | 3 / 37 to 40 | 7 | 7 / 33 | 7 / 209 to 214 | 407 / 218 to 238 | 4,954 / 3,890 |
-| clustered | 1000 | 8 / 276 to 284 | 7 | 15 / 305 to 316 | 15 / 2,443 to 2,506 | 4,015 / 2,282 to 2,286 | 49,954 / 39,890 |
-| interleaved | 1 | 3 / 9 to 12 | 7 | 7 / 3 to 4 | 7 / 19 | 11 / 6 | 113 / 39 |
-| interleaved | 10 | 3 / 11 to 12 | 7 | 15 / 8 to 12 | 15 / 37 to 44 | 55 / 28 | 545 / 390 |
-| interleaved | 100 | 3 / 35 to 36 | 7 | 94 to 95 / 57 to 62 | 94 to 95 / 248 | 494 to 495 / 250 to 261 | 4,955 / 3,990 |
-| interleaved | 1000 | 8 / 284 to 291 | 7 to 11 | 894 / 594 to 600 | 894 / 2,818 to 3,243 | 4,894 / 2,583 to 2,615 | 49,955 / 40,890 |
+| clustered | 1 | 3 / 9 | 7 | 7 / 4 | 7 / 19 to 24 | 11 / 4 to 6 | 112 / 38 |
+| clustered | 10 | 3 / 11 to 16 | 6 to 7 | 7 / 6 to 7 | 7 / 34 to 39 | 47 / 22 to 27 | 544 / 380 |
+| clustered | 100 | 3 / 35 to 40 | 7 to 8 | 7 / 33 to 36 | 7 / 209 to 214 | 407 / 237 to 244 | 4,954 / 3,890 |
+| clustered | 1000 | 8 / 274 to 285 | 7 to 9 | 15 to 16 / 312 to 347 | 15 to 16 / 2,339 to 2,463 | 4,015 to 4,016 / 2,221 to 2,377 | 49,954 / 39,890 |
+| interleaved | 1 | 3 / 9 to 10 | 7 to 8 | 7 / 3 to 4 | 7 / 19 to 22 | 11 / 4 to 6 | 113 / 39 |
+| interleaved | 10 | 3 / 11 to 12 | 7 to 8 | 15 / 8 to 9 | 15 / 36 to 38 | 55 / 29 to 35 | 545 / 390 |
+| interleaved | 100 | 3 / 35 to 40 | 7 to 8 | 94 to 95 / 56 to 62 | 94 to 95 / 248 to 253 | 494 to 495 / 252 to 267 | 4,955 / 3,990 |
+| interleaved | 1000 | 8 / 276 to 285 | 7 to 8 | 894 / 600 to 635 | 894 / 2,746 to 2,858 | 4,894 / 2,581 to 2,881 | 49,955 / 40,890 |
 
 - **Logical reads: the document reads the fewest blocks.** 3 up to 100 lines
-  and 8 at 1,000, against 7 to 15 for the clustered join and about one block
+  and 8 at 1,000, against 7 to 16 for the clustered join and about one block
   per line for the interleaved join.
-- **CPU (200 runs, about 5 microseconds of resolution).** At 1 line the join
-  uses less than the serialized document in both layouts (3 to 4 against 9 to
-  12 microseconds), and at 10 lines clustered (6 against 12). At 10 lines
-  interleaved and 100 lines clustered they are not separated (8 to 12 against
-  11 to 12; 33 against 37 to 40). At 100 lines interleaved and at 1,000 lines
-  the document uses less (35 to 36 against 57 to 62; 276 to 291 against 305
-  to 600).
+- **CPU (200 runs, about 5 microseconds of resolution).** At 1 and 10 lines,
+  in both layouts, the join and the serialized document are not separated (3
+  to 9 against 9 to 16 microseconds; the gaps are at most one step). At 100
+  lines clustered they are not separated either (33 to 36 against 35 to 40).
+  At 100 lines interleaved and at 1,000 lines the document uses less (35 to 40
+  against 56 to 62; 274 to 285 against 312 to 635). In database-side elapsed
+  time, which has no such step, the join takes less than the document at 1
+  and 10 lines in both layouts (3 to 9 against 9 to 12).
 - **Most of the document's CPU above 10 lines is making text.** Returned as
-  OSON, the same document takes 7 to 11 microseconds at every size. At 1 and
+  OSON, the same document takes 7 to 9 microseconds at every size. At 1 and
   10 lines that is not separated from the join. At 1,000 lines the document
   is stored out of the row, and the probe returns a pointer to it without
   reading the body (3 buffer gets against the serialized reader's 8), so
   there its figure leaves out the body read and is only a lower bound.
 - **The duality view is a join that also builds the document on every
-  read.** It uses about twice the document's CPU at 1 line (19 to 20) and
-  about 9 to 11 times at 1,000 lines (2,443 to 3,243 microseconds).
+  read.** It uses about 2 to 3 times the document's CPU at 1 line (19 to 24)
+  and about 8 to 10 times at 1,000 lines (2,339 to 2,858 microseconds).
 - **Bytes.** As text, the document is larger than the row set: it carries
   every field name, while the row set repeats the order fields on every line.
   112 against 38 bytes at one line, about 25% more at 100 and 1,000 lines.
@@ -481,9 +491,9 @@ microseconds from `v$sql`). The older one-centisecond figures from
 `measure_repeat` (k = 100 and 1,000, target 1) are still recorded; at that
 resolution they do not separate the readers.
 
-**What it shows.** Two validator runs on the current scripts. Each cell is the median over
-the 20 targets (a range when the two runs differed), with the lowest and
-highest target over both runs in brackets. The last column is target 1 alone
+**What it shows.** The four runs. Each cell is the median over the 20
+targets (a range when the runs differed), with the lowest and highest target
+over all four runs in brackets. The last column is target 1 alone
 (the single-target metrics; for hashk, hdv and hdoc only CPU is recorded
 there).
 
@@ -491,63 +501,63 @@ there).
 
 | reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
 |---|---|---|---|---|
-| doc | 3 (3) | 9 to 10 (7 to 10) | 113 | 3 / 9 to 10 |
+| doc | 3 (3) | 9 to 10 (7 to 11) | 113 | 3 / 10 |
 | heap | 7 (7) | 4 (4) | 39 | 7 / 4 |
 | cov | 6 (6) | 4 (3 to 4) | 39 | 6 / 4 |
-| iot | 6 (6) | 4 (4) | 39 | 6 / 4 |
+| iot | 6 (6) | 4 (3 to 4) | 39 | 6 / 4 |
 | iotc | 6 (6) | 4 (4) | 39 | 6 / 4 |
 | clu | 6 (6) | 4 (4) | 39 | 6 / 4 |
 | hash (SIZE 512) | 2 (2) | 3 (3 to 4) | 39 | 2 / 3 to 4 |
-| dv (over iot) | 6 (6) | 20 (20 to 30) | 195 | 6 / 20 |
-| hashk (sized for k) | 2 (2 to 6) | 3 (3 to 5) | 39 | - / 4 |
-| hdv (over hashk) | 2 (2 to 6) | 19 (15 to 31) | 195 | - / 19 |
-| hdoc | 1 (1 to 3) | 9 (7 to 10) | 113 | - / 9 |
+| dv (over iot) | 6 (6) | 20 to 21 (16 to 30) | 195 | 6 / 20 to 30 |
+| hashk (sized for k) | 2 (2 to 6) | 3 (3 to 5) | 39 | - / 3 to 4 |
+| hdv (over hashk) | 2 (2 to 6) | 19 (16 to 22) | 195 | - / 18 to 19 |
+| hdoc | 1 (1 to 3) | 9 (7 to 11) | 113 | - / 9 to 10 |
 
 10 lines per order:
 
 | reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
 |---|---|---|---|---|
-| doc | 3 (3) | 12 (11 to 13) | 546 | 3 / 12 |
-| heap | 15 (15) | 9 (9 to 18) | 400 | 15 / 9 to 10 |
+| doc | 3 (3) | 12 (12 to 20) | 546 | 3 / 12 |
+| heap | 15 (15) | 9 to 10 (7 to 15) | 400 | 15 / 9 to 10 |
 | cov | 6 (6 to 7) | 6 (6 to 7) | 400 | 6 / 6 |
 | iot | 6 (6 to 7) | 6 (6 to 7) | 400 | 6 / 6 |
 | iotc | 6 (6 to 7) | 6 (6 to 7) | 400 | 6 / 6 |
-| clu | 6 (6) | 6 (6) | 400 | 6 / 6 |
-| hash (SIZE 512) | 2 (2) | 5 (5 to 6) | 400 | 2 / 5 |
-| dv (over iot) | 6 (6 to 7) | 35 (34 to 45) | 628 | 6 / 35 to 36 |
-| hashk (sized for k) | 2 (2) | 5 (5 to 12) | 400 | - / 5 |
-| hdv (over hashk) | 2 (2) | 32 to 33 (32 to 43) | 628 | - / 32 to 33 |
-| hdoc | 1 (1 to 3) | 11 (7 to 13) | 546 | - / 11 to 13 |
+| clu | 6 (6) | 6 (6 to 7) | 400 | 6 / 6 |
+| hash (SIZE 512) | 2 (2) | 5 (5 to 7) | 400 | 2 / 5 |
+| dv (over iot) | 6 (6 to 7) | 34 to 35 (34 to 44) | 628 | 6 / 34 to 42 |
+| hashk (sized for k) | 2 (2) | 5 (5 to 6) | 400 | - / 5 to 6 |
+| hdv (over hashk) | 2 (2) | 32 to 33 (26 to 43) | 628 | - / 32 to 33 |
+| hdoc | 1 (1 to 3) | 11 (7 to 19) | 546 | - / 11 |
 
 100 lines per order:
 
 | reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
 |---|---|---|---|---|
-| doc | 3 (3) | 35 to 36 (35 to 46) | 4,956 | 3 / 36 to 38 |
-| heap | 95 (95 to 96) | 61 to 64 (60 to 77) | 4,090 | 96 / 60 to 65 |
-| cov | 7 (6 to 7) | 27 (18 to 36) | 4,090 | 7 / 27 to 28 |
-| iot | 7 (6 to 8) | 28 (26 to 38) | 4,090 | 7 / 27 to 28 |
-| iotc | 6 (6 to 7) | 28 (26 to 39) | 4,090 | 6 / 28 to 39 |
-| clu | 6 (6) | 27 (26 to 37) | 4,090 | 6 / 27 |
-| hash (SIZE 512) | 2 (2 to 6) | 25 (24 to 34) | 4,090 | 2 / 25 |
-| dv (over iot) | 7 (6 to 8) | 215 (205 to 216) | 5,038 | 7 / 215 to 216 |
-| hashk (sized for k) | 2 (2) | 24 to 25 (24 to 34) | 4,090 | - / 24 |
-| hdv (over hashk) | 2 (2) | 204 (194 to 209) | 5,038 | - / 204 |
+| doc | 3 (3) | 35 to 36 (35 to 45) | 4,956 | 3 / 35 to 36 |
+| heap | 95 (95 to 96) | 61 to 63 (60 to 74) | 4,090 | 96 / 61 to 64 |
+| cov | 7 (6 to 7) | 26 to 27 (23 to 37) | 4,090 | 7 / 26 to 27 |
+| iot | 7 (6 to 8) | 27 to 28 (26 to 35) | 4,090 | 7 / 26 to 28 |
+| iotc | 6 (6 to 7) | 27 to 28 (25 to 43) | 4,090 | 6 / 27 to 28 |
+| clu | 6 (6) | 26 to 27 (26 to 33) | 4,090 | 6 / 26 to 27 |
+| hash (SIZE 512) | 2 (2 to 6) | 24 to 25 (16 to 35) | 4,090 | 2 / 24 to 25 |
+| dv (over iot) | 7 (6 to 8) | 205 to 215 (205 to 227) | 5,038 | 7 / 205 to 215 |
+| hashk (sized for k) | 2 (2) | 24 (24 to 35) | 4,090 | - / 24 to 25 |
+| hdv (over hashk) | 2 (2) | 204 (194 to 216) | 5,038 | - / 194 to 206 |
 
 1000 lines per order:
 
 | reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
 |---|---|---|---|---|
-| doc | 8 (8) | 277 (272 to 296) | 49,956 | 8 / 272 to 277 |
-| heap | 899 (898 to 900) | 701 to 719 (678 to 950) | 41,890 | 898 / 719 to 721 |
-| cov | 16 (15 to 17) | 243 to 253 (238 to 263) | 41,890 | 14 / 243 to 263 |
-| iot | 14 (11 to 26) | 253 to 263 (242 to 273) | 41,890 | 24 / 252 to 265 |
-| iotc | 11 (11 to 12) | 253 to 263 (243 to 263) | 41,890 | 11 / 253 to 263 |
-| clu | 64 to 65 (54 to 70) | 285 to 286 (275 to 314) | 41,890 | 63 to 65 / 286 |
-| hash (SIZE 512) | 118 (108 to 126) | 275 to 285 (265 to 295) | 41,890 | 124 / 275 to 285 |
-| dv (over iot) | 13 (11 to 25) | 2,389 to 2,409 (2,309 to 2,455) | 50,038 | 24 / 2,410 to 2,416 |
-| hashk (sized for k) | 12 (12) | 216 to 226 (214 to 241) | 41,890 | - / 235 to 236 |
-| hdv (over hashk) | 10 (10) | 2,301 to 2,351 (2,250 to 2,404) | 50,038 | - / 2,296 to 2,404 |
+| doc | 8 (8) | 277 to 284 (274 to 294) | 49,956 | 8 / 274 to 287 |
+| heap | 899 (898 to 900) | 708 to 721 (688 to 797) | 41,890 | 898 / 711 to 759 |
+| cov | 16 (15 to 17) | 240 to 253 (226 to 258) | 41,890 | 14 / 238 to 253 |
+| iot | 14 (11 to 26) | 253 (242 to 265) | 41,890 | 24 / 252 to 263 |
+| iotc | 11 (11 to 12) | 248 to 262 (242 to 272) | 41,890 | 11 / 253 to 263 |
+| clu | 64 to 65 (54 to 71) | 276 to 286 (274 to 297) | 41,890 | 63 to 66 / 275 to 295 |
+| hash (SIZE 512) | 118 (108 to 126) | 273 to 276 (263 to 286) | 41,890 | 124 / 275 to 286 |
+| dv (over iot) | 13 (11 to 25) | 2,319 to 2,449 (2,309 to 2,499) | 50,038 | 24 / 2,309 to 2,469 |
+| hashk (sized for k) | 12 (12) | 226 (214 to 243) | 41,890 | - / 214 to 236 |
+| hdv (over hashk) | 10 (10) | 2,270 to 2,331 (2,259 to 2,571) | 50,038 | - / 2,260 to 2,341 |
 
 - **Logical reads.** Up to 100 lines the hash clusters read 2 blocks, the
   document in a hash cluster 1, and the document 3. The covering index, the
@@ -557,29 +567,31 @@ there).
   compressed IOT (11) and the sized hash cluster (12).
 - **Many large orders growing at once hurt the fixed-size clusters.** With 20
   orders of 1,000 lines growing together, their overflow blocks interleave:
-  the index cluster reads 64 (median) blocks and the `SIZE 512` hash
+  the index cluster reads 64 to 65 (median) blocks and the `SIZE 512` hash
   cluster 118, against 11 and 14 on the earlier load with one
   large order. The plain IOT varies by target (11 to 26), and so does the
   duality view over it. The compressed IOT, moved after the load, does not.
 - **CPU (100 runs per target, about 10 microseconds of resolution).** The
   readers are told apart in CPU only where the gap is larger than that:
-  - at 1 and 10 lines no join is separated from the document in CPU (3 to 9
+  - at 1 and 10 lines no join is separated from the document in CPU (3 to 10
     microseconds against 9 to 12). In database-side elapsed time, which has
     no such step, every co-located join and the heap join take less than the
-    document (3 to 9 against 9 to 12), and the document in a hash cluster is
+    document (3 to 10 against 9 to 12), and the document in a hash cluster is
     not separated from it;
-  - at 100 lines the two hash clusters use less CPU than the document (24 to
-    25 against 35 to 36); the covering index, the IOTs and the index cluster
-    (27 to 28) are not separated in CPU, and take less in elapsed time;
+  - at 100 lines the sized hash cluster uses less CPU than the document (24
+    against 35 to 36); the fixed hash cluster (24 to 25), the covering index,
+    the IOTs and the index cluster (26 to 28) are not separated in CPU, and
+    all of them take less in elapsed time;
   - at 1,000 lines the covering index, both IOTs and the sized hash cluster
-    use less CPU than the document (216 to 263 against 277); the index
+    use less CPU than the document (226 to 262 against 277 to 284); the index
     cluster and the fixed hash cluster are not separated from it;
   - the duality views use the most CPU at every size (about 2 times the
     document at 1 line, about 8 to 9 times at 1,000 lines).
-  The document as OSON, in S1, takes 7 to 11 microseconds, so the comparison
+  The document as OSON, in S1, takes 7 to 9 microseconds, so the comparison
   depends on whether the client asks for text.
 - **The document in a hash cluster** reads 1 block for most targets (up to 3)
-  and uses 7 to 13 microseconds; it is not separated from the collection
+  and uses 9 to 11 microseconds (median; 7 to 19 over the targets); it is not
+  separated from the collection
   document at the sizes where it fits.
 - **Twenty targets against one.** Up to 100 lines, every reader's median
   equals target 1 within a read or two. At 1,000 lines the medians differ
@@ -683,54 +695,55 @@ CPU microseconds in place of logical reads
 (`s1b-crossover-item-queries-per-1000-order-reads-k<k>-us`, or
 `s1b-no-crossover-k<k>-us` = 1), each side again the cheaper of its two
 readers, this time in CPU. Logical reads are the counted second execution;
-CPU is a range over the two validator runs on the current scripts.
+every cell is a range over the four runs.
 
 | k | reader | reads | CPU us | bytes |
 |---|---|---|---|---|
-| 10 | childtable-plain | 22 to 23 | 7 to 11 | 200 |
+| 10 | childtable-plain | 22 to 23 | 11 | 200 |
 | 10 | childtable-covered | 2 | 4 | 200 |
-| 10 | orderdocs-jsontable | 22 | 94 to 100 | 200 |
-| 10 | orderdocs-serialized | 22 | 93 to 95 | 10,771 |
+| 10 | orderdocs-jsontable | 22 | 95 to 101 | 200 |
+| 10 | orderdocs-serialized | 22 | 91 to 98 | 10,771 |
 | 10 | itemdv | 2 | 4 | 200 |
 | 10 | doc | 3 | 11 to 12 | 538 |
 | 10 | join | 6 | 6 | 374 |
 | 100 | childtable-plain | 23 | 11 | 220 |
 | 100 | childtable-covered | 2 | 4 | 220 |
-| 100 | orderdocs-jsontable | 22 | 608 to 624 | 220 |
-| 100 | orderdocs-serialized | 22 | 561 to 626 | 98,971 |
+| 100 | orderdocs-jsontable | 22 | 594 to 614 | 220 |
+| 100 | orderdocs-serialized | 22 | 567 to 581 | 98,971 |
 | 100 | itemdv | 2 | 4 | 220 |
-| 100 | doc | 3 | 35 | 4,948 |
-| 100 | join | 8 | 35 to 37 | 3,884 |
+| 100 | doc | 3 | 34 to 35 | 4,948 |
+| 100 | join | 8 | 33 to 37 | 3,884 |
 | 1000 | childtable-plain | 22 | 10 to 11 | 240 |
 | 1000 | childtable-covered | 2 | 4 | 240 |
-| 1000 | orderdocs-jsontable | 222 | 5,913 to 5,973 | 240 |
-| 1000 | orderdocs-serialized | 122 | 5,359 to 5,560 | 998,971 |
+| 1000 | orderdocs-jsontable | 222 | 5,730 to 7,114 | 240 |
+| 1000 | orderdocs-serialized | 122 | 5,364 to 5,619 | 998,971 |
 | 1000 | itemdv | 2 | 4 | 240 |
-| 1000 | doc | 8 | 277 to 289 | 49,948 |
-| 1000 | join | 13 to 14 | 305 to 317 | 39,884 |
+| 1000 | doc | 8 | 276 to 285 | 49,948 |
+| 1000 | join | 13 to 14 | 305 to 310 | 39,884 |
 
 | k | crossover, logical reads | crossover, CPU us |
 |---|---|---|
 | 10 | 150 | none |
-| 100 | 250 | 3.23 in 1 run, none in 1 |
-| 1000 | 42 to 50 | 5.04 to 5.23 |
+| 100 | 250 | 1.76 to 3.55 in 2 runs, none in 2 |
+| 1000 | 42 to 50 | 3.56 to 6.32 |
 
 - **The item query costs the documents far more CPU than reads suggest.**
   The child table answers in about 4 microseconds at every size. The order
-  documents take about 95 microseconds at 10 lines, about 560 to 620 at 100
-  and about 5,400 to 5,600 at 1,000: every matching order is read and
+  documents take about 90 to 100 microseconds at 10 lines, about 570 to 610
+  at 100 and about 5,400 to 7,100 at 1,000: every matching order is read and
   serialized (or scanned by `JSON_TABLE`) whole, and the serialized reader
   returns 10,771 to 998,971 bytes to deliver 20 pairs (200 to 240 bytes from
   the child table).
 - **The order read by key, in CPU (200 runs, about 5 microseconds of
-  resolution).** At 10 lines the join uses less than the document (6 against
-  11 to 12). At 100 lines they are not separated (35 to 37 against 35). At
-  1,000 lines the document uses less (277 to 289 against 305 to 317).
-- **So the crossover in CPU:** at 10 lines there is none (the normalized
-  tables use less CPU for both queries). At 100 lines the order reads are not
-  separated, so no crossover is stated (one run computed 3.23, the other
-  none). At 1,000 lines it is 5.04 to 5.23 item queries per 1,000 order reads
-  in both runs, against 42 to 50 in logical reads.
+  resolution).** At 10 lines they are not separated in CPU (6 against 11 to
+  12, a gap of one step); in elapsed time the join takes less. At 100 lines
+  they are not separated (33 to 37 against 34 to 35). At 1,000 lines the
+  document uses less (276 to 285 against 305 to 310).
+- **So the crossover in CPU:** at 10 and 100 lines the order reads are not
+  separated, so no crossover is stated (at 10 lines no run computed one; at
+  100 lines two runs computed 1.76 and 3.55, and two none). At 1,000 lines it
+  is 3.56 to 6.32 item queries per 1,000 order reads in all four runs,
+  against 42 to 50 in logical reads.
 
 Expected assertions:
 
@@ -849,8 +862,8 @@ updates with `m08_meter.measure_dml_us` (200 runs each, microseconds from
 statement, and the update's CPU includes its undo and redo generation). The
 crossover is computed again with CPU microseconds in place of logical reads,
 `s2-crossover-updates-per-1000-reads-us` (or `s2-no-crossover-us` = 1). Logical
-reads are the counted second execution; CPU is a range over the two validator runs
-on the current scripts.
+reads are the counted second execution; every cell is a range over the four
+runs.
 
 | statement | reads | CPU us | bytes |
 |---|---|---|---|
@@ -858,18 +871,20 @@ on the current scripts.
 | embedded-read-oson | - | 8 | 134 |
 | normalized-read-pk | 6 | 3 | 25 |
 | normalized-read-covered | 4 | 3 | 25 |
-| embedded-update | 1,094 to 1,096 | 2,852 to 2,853 | - |
-| normalized-update | 7 | 9 to 10 | - |
+| embedded-update | 1,094 to 1,096 | 2,795 to 2,923 | - |
+| normalized-update | 7 | 9 to 12 | - |
 | crossover (tier changes per 1,000 order reads) | 0.90 | none | |
 
 - **In CPU the embedded read costs more than the join.** The embedded order
   takes 10 microseconds and the normalized join 3. The embedded read saves an
   index probe in logical reads, but returning a document costs more CPU than
   returning a row. Returned as OSON instead of text
-  (`s2-embedded-read-oson`), it still takes 8.
-- **So in CPU there is no crossover** (`s2-no-crossover-us` = 1 in both runs):
-  the normalized form uses less CPU for the read and for the tier change (9
-  to 10 microseconds against about 2,850 for 100 documents). Measured in
+  (`s2-embedded-read-oson`), it takes 8, which is not separated from the
+  join's 3 at this resolution.
+- **So in CPU there is no crossover** (`s2-no-crossover-us` = 1 in all four
+  runs): the normalized form uses less CPU for the read and for the tier
+  change (9 to 12 microseconds against about 2,800 to 2,900 for 100
+  documents). Measured in
   logical reads, the crossover is 0.9 tier changes per 1,000 order reads.
 
 Expected assertions:
@@ -959,9 +974,8 @@ The crossover formula is S1b's, rounded to two decimals:
 q = 1000 * (join - doc) / (orderdocs - childtable)
 ```
 
-Logical reads over four validator runs, three back to back and one on a
-freshly built database. A range means the runs differed; the article takes
-its numbers from `validator/results.json`.
+Logical reads over the four runs. A range means the runs differed; the
+article takes its numbers from `validator/results.json`.
 
 | k | M | childtable | orderdocs | doc | join | crossover q (item queries per 1,000 order reads) |
 |---|---|---|---|---|---|---|
@@ -969,17 +983,15 @@ its numbers from `validator/results.json`.
 | 100 | 20 | 2 | 22 | 3 | 6 | 150 |
 | 100 | 100 | 2 | 102 | 3 | 6 | 30 |
 | 100 | 500 | 4 | 503 | 3 | 6 | 6.01 |
-| 1000 | 5 | 3 | 33 | 8 | 14 to 15 | 200 to 233.33 |
-| 1000 | 20 | 3 | 123 | 8 | 14 to 15 | 50 to 58.33 |
-| 1000 | 100 | 3 | 603 | 8 | 14 to 15 | 10 to 11.67 |
-| 1000 | 500 | 5 | 2649 | 8 | 14 to 15 | 2.27 to 2.65 |
+| 1000 | 5 | 3 | 33 | 8 | 14 | 200 |
+| 1000 | 20 | 3 | 123 | 8 | 14 | 50 |
+| 1000 | 100 | 3 | 603 | 8 | 14 | 10 |
+| 1000 | 500 | 5 | 2,649 | 8 | 14 | 2.27 |
 
-The k = 1,000 join read was 14 in six validator runs and 15 in two (one of
-them the first run on a freshly built database); in the two runs on the current scripts it
-was 14 both times. One read
-in the numerator moves every k = 1,000 crossover by about 15% (200 to 233 at
+The k = 1,000 join read was 14 in all four runs. One read more in the
+numerator would move every k = 1,000 crossover by about 15% (200 to 233 at
 M = 5, 2.27 to 2.65 at M = 500), as S1b warned. The k = 100 figures were the
-same in all ten runs.
+same in all four runs.
 
 **How strongly it depends on M: about in inverse proportion.** The child table
 answers from the covering index in 2 to 5 reads whatever M is. The order
@@ -1020,66 +1032,68 @@ q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
 
 | N | docs touched | embedded update reads | embedded update redo (bytes) | normalized update reads / redo | emb_read | norm_read | crossover q (tier changes per 1,000 order reads) |
 |---|---|---|---|---|---|---|---|
-| 10 | 10 | 126 | 13,972 | 7 / 784 | 3 | 4 | 8.40 |
+| 10 | 10 | 124 to 126 | 13,904 to 13,972 | 7 / 784 | 3 | 4 | 8.40 to 8.55 |
 | 100 | 100 | 1,098 to 1,100 | 125,868 to 125,936 | 7 / 784 | 3 | 4 | 0.91 to 0.92 |
-| 1000 | 1,000 | 10,223 to 10,225 | 1,169,516 to 1,169,596 | 7 / 784 | 3 | 4 | 0.10 |
+| 1000 | 1,000 | 10,219 to 10,233 | 1,168,944 to 1,169,396 | 7 / 784 | 3 | 4 | 0.10 |
 
 **How strongly it depends on N: about in inverse proportion.** The embedded update
 costs about 10 to 13 reads and about 1,170 to 1,400 bytes of redo per embedded copy (more per copy at
 smaller N), so
 its cost grows linearly with N, while the read advantage stays at one logical
 read (the customer index probe the embedded read skips) at every N. The
-crossover therefore falls as 1/N: about 8.4 tier changes per 1,000 order reads
+crossover therefore falls as 1/N: about 8.4 to 8.6 tier changes per 1,000 order reads
 at N = 10, 0.91 to 0.92 at N = 100 (S2's 0.9) and 0.10 at N = 1,000. A customer with ten
 times more orders can change its tier ten times less often before embedding
 stops paying. S2's number holds only at N = 100. What does not change is the
 direction: a crossover exists at every N.
 
 **The crossovers in CPU time.** Every point is timed again with
-`m08_meter.measure_us` (reads) and `m08_meter.measure_dml_us` (updates): 20
+`m08_meter.measure_us` (reads) and `m08_meter.measure_dml_us` (updates): 200
 runs, microseconds from `v$sql`, each timed cursor checked to run the same plan
 as its counted cursor (`s1c-us-same-plan`, `s2c-us-same-plan`). The crossovers
 are computed again with CPU microseconds in place of logical reads
-(`...-crossover-...-us`, or `...-no-crossover-us` = 1). Ranges over the two
-validator runs on the current scripts; "none" means no crossover in that run.
+(`...-crossover-...-us`, or `...-no-crossover-us` = 1). Ranges over the four
+runs; "none" means no crossover in that run.
 
 | k | M | childtable CPU us | orderdocs CPU us | doc CPU us | join CPU us | crossover, reads | crossover, CPU |
 |---|---|---|---|---|---|---|---|
-| 100 | 5 | 2 to 3 | 153 to 161 | 35 | 32 | 600 | none |
-| 100 | 20 | 4 | 573 to 578 | 35 | 32 | 150 | none |
-| 100 | 100 | 12 | 2,857 to 2,926 | 35 | 32 | 30 | none |
-| 100 | 500 | 49 to 55 | 14,489 to 14,564 | 35 | 32 | 6.01 | none |
-| 1000 | 5 | 3 | 1,343 to 1,423 | 280 to 285 | 308 to 325 | 200 | 16.20 to 33.58 |
-| 1000 | 20 | 4 | 5,375 to 5,387 | 280 to 285 | 308 to 325 | 50 | 4.28 to 8.36 |
-| 1000 | 100 | 12 to 13 | 27,289 to 27,474 | 280 to 285 | 308 to 325 | 10 | 0.84 to 1.64 |
-| 1000 | 500 | 49 to 55 | 141,054 to 142,352 | 280 to 285 | 308 to 325 | 2.27 | 0.16 to 0.32 |
+| 100 | 5 | 2 to 3 | 143 to 148 | 35 to 36 | 32 to 37 | 600 | 7.14 in 1 run, none in 3 |
+| 100 | 20 | 4 | 559 to 583 | 35 to 36 | 32 to 37 | 150 | 1.73 in 1 run, none in 3 |
+| 100 | 100 | 12 to 14 | 2,772 to 2,862 | 35 to 36 | 32 to 37 | 30 | 0.36 in 1 run, none in 3 |
+| 100 | 500 | 49 to 53 | 14,105 to 14,564 | 35 to 36 | 32 to 37 | 6.01 | 0.07 in 1 run, none in 3 |
+| 1000 | 5 | 2 to 3 | 1,347 to 1,396 | 276 to 286 | 305 to 323 | 200 | 13.74 to 34.97 |
+| 1000 | 20 | 4 | 5,364 to 5,529 | 276 to 286 | 305 to 323 | 50 | 3.53 to 8.77 |
+| 1000 | 100 | 11 to 12 | 27,255 to 27,677 | 276 to 286 | 305 to 323 | 10 | 0.69 to 1.73 |
+| 1000 | 500 | 49 to 54 | 136,247 to 141,143 | 276 to 286 | 305 to 323 | 2.27 | 0.14 to 0.35 |
 
 | N | embedded read CPU us | normalized read CPU us | embedded update CPU us | normalized update CPU us | crossover, reads | crossover, CPU |
 |---|---|---|---|---|---|---|
-| 10 | 9 | 3 | 308 to 317 | 14 | 8.40 | none |
-| 100 | 9 | 3 | 2,900 to 2,912 | 14 | 0.91 to 0.92 | none |
-| 1000 | 9 | 3 | 30,733 to 31,144 | 18 to 20 | 0.10 | none |
+| 10 | 9 | 2 to 3 | 312 to 357 | 14 | 8.40 to 8.55 | none |
+| 100 | 9 | 3 | 2,789 to 2,961 | 14 to 16 | 0.91 to 0.92 | none |
+| 1000 | 9 | 3 | 30,685 to 30,957 | 14 to 17 | 0.10 | none |
 
-- **S1b sweep.** In CPU the order documents pay about 29 microseconds per
-  matching order at 100 lines and about 280 at 1,000 lines, against 2 to 55
-  for the child table. At 100 lines the order read by key is not separated
-  between the join and the document (32 against 35), so no crossover in CPU
-  is stated at any M (both runs computed none). At 1,000 lines the document
-  uses less CPU for the order read (280 to 285 against 308 to 325), and a
-  crossover in CPU exists at every M in both runs: 16 to 34 item queries per
-  1,000 order reads at M = 5, falling to 0.16 to 0.32 at M = 500, against 200
-  and 2.27 in logical reads. Its numerator is a gap of 23 to 45 microseconds,
-  so the CPU values move by up to two times between runs.
+- **S1b sweep.** In CPU the order documents pay about 28 to 30 microseconds
+  per matching order at 100 lines and about 270 to 280 at 1,000 lines,
+  against 2 to 54 for the child table. At 100 lines the order read by key is not separated
+  between the join and the document (32 to 37 against 35 to 36), so no
+  crossover in CPU is stated at any M (one run computed one at every M, the
+  other three none). At 1,000 lines the document
+  uses less CPU for the order read (276 to 286 against 305 to 323), and a
+  crossover in CPU exists at every M in all four runs: 14 to 35 item queries
+  per 1,000 order reads at M = 5, falling to 0.14 to 0.35 at M = 500, against
+  200 and 2.27 in logical reads. Its numerator is a gap of 19 to 47
+  microseconds, so the CPU values move by up to about two and a half times
+  between runs.
 - **S2 sweep.** In CPU the embedded read costs more than the join at every N
   (9 microseconds against 3), so there is no crossover in CPU at any N: the
   normalized form uses less CPU for both the read and the tier change. The
   embedded update's CPU grows with N (about 310, 2,900 and 31,000
   microseconds at N = 10, 100 and 1,000); the normalized update stays at 14
-  to 20.
+  to 17.
 - **What changes and what does not.** In logical reads each crossover falls
   about in inverse proportion to its parameter and exists at every point. In
   CPU, the S2 crossovers disappear at every N, and the S1b crossovers exist
-  only at 1,000 lines, where they are 6 to 12 times lower than in logical
+  only at 1,000 lines, where they are 6 to 16 times lower than in logical
   reads.
 
 **Time.** CPU and elapsed medians come from 20 timed runs. For the S1b sweep
@@ -1087,8 +1101,8 @@ they are from `m08_meter.measure_repeat` for the item readers at M = 100 and
 500; for the S2 sweep, from a loop of 20 embedded updates at N = 100 and 1,000,
 each committed after it is measured. Those loops also record
 `s2c-n{N}-embedded-update-timed-reads-median` for audit only: with a commit
-after every run its value moves widely between runs (8,841 to 11,521 at
-N = 1,000 over four validator runs, the low one on a freshly built database), so the crossover uses the counted second
+after every run its value moves widely between runs (8,840 to 11,521 at
+N = 1,000 over the four runs, the low one on the freshly built database), so the crossover uses the counted second
 execution, never this figure. At the meter's one-centisecond
 resolution the child table reads 0 cs everywhere, the order documents 2 cs at
 k = 100, M = 500 (1 to 2 cs) and 3 to 15 cs at k = 1,000, and the embedded update 0 cs at
@@ -1379,42 +1393,42 @@ about 10% or under 0.1 ms per call, count as unchanged. A statement is
 when one goes up and the other does not go down, and *the same* when neither
 changes. When one goes down and the other up, the text names both.
 
-**Results.** Ranges over four validator runs, three back to back and one on a
-freshly built database; the article takes its numbers from
+**Results.** Ranges over the four runs; the article takes its numbers from
 `validator/results.json`. Logical reads per call, with CPU per call in
 milliseconds in brackets:
 
 | Statement | Stage 0 (collection) | Stage 1 (view, JSON column) | Stage 2 (promoted columns) | Stage 3 (lines table) |
 |---|---|---|---|---|
-| `byid` | 3 (0.01 to 0.02) | 3 (0.04 to 0.08) | 3 (0.04 to 0.08) | 9 to 11 (0.07 to 0.12) |
-| `status` | 1,199 to 1,204 (2.4 to 3.1) | 1,525 to 1,528 (464 to 475) | 1,525 to 1,528 (42 to 52) | 7,356 to 7,429 (69 to 81) |
-| `sku-hot` | 1,386 to 1,389 (2.7 to 3.1) | 1,532 to 1,535 (491 to 514) | 1,532 to 1,535 (484 to 495) | 9,933 to 9,952 (104 to 112) |
-| `sku-rare` | 6 to 7 (0.01 to 0.02) | 1,508 (427 to 431) | 1,508 (420 to 430) | 30 (0.08 to 0.12) |
-| `agg-status` | 1,173 (11.6 to 12.3) | 1,508 (470 to 481) | 1,508 (57) | 20,092 to 20,354 (1,110 to 1,129) |
-| `agg-unwind` | 1,577 (1,463 to 1,478) | 1,508 (2,322 to 2,383) | 1,508 (2,336 to 2,427) | 17,174 to 17,475 (3,382 to 3,401) |
+| `byid` | 3 (0.01 to 0.03) | 3 (0.05 to 0.09) | 3 (0.04 to 0.07) | 9 (0.06 to 0.08) |
+| `status` | 1,200 to 1,202 (2.5 to 3.1) | 1,526 to 1,528 (462 to 465) | 1,526 to 1,528 (44 to 51) | 7,380 to 7,416 (72 to 74) |
+| `sku-hot` | 1,387 to 1,388 (2.9 to 3.0) | 1,530 to 1,533 (492 to 495) | 1,530 to 1,533 (489 to 495) | 9,913 to 9,938 (103 to 108) |
+| `sku-rare` | 6 (0.01 to 0.02) | 1,508 (426 to 433) | 1,508 (423 to 428) | 30 (0.08 to 0.14) |
+| `agg-status` | 1,173 to 1,174 (11.6 to 12.1) | 1,508 (463 to 468) | 1,508 (57 to 58) | 20,137 to 20,324 (1,115 to 1,128) |
+| `agg-unwind` | 1,577 to 1,634 (1,462 to 1,476) | 1,508 (2,354 to 2,404) | 1,508 (2,341 to 2,387) | 17,224 to 17,420 (3,384 to 3,460) |
 
 **Direct-SQL controls** (same four runs; SQL sent straight to the tables, not
 app statements):
 
 | Stage | Control | Reads per call | CPU ms | Executed plan |
 |---|---|---|---|---|
-| 1 | the API's `status` predicate, `json_exists(data, '$?(@.status.stringOnly() == $B0)')`, on `M08B3_ORDERS_T` | 1,516 to 1,518 | 9.6 to 11.2 | full scan |
-| 1 | `json_value(data, '$.status') = 'open'` on `M08B3_ORDERS_T` | 1,516 to 1,518 | 5.0 to 5.7 | full scan (the function index is not chosen for 10% of the rows) |
-| 1 | the API's `items.sku` predicate on `M08B3_ORDERS_T`, `SKU-RARE` | 6 | 0.01 to 0.04 | multivalue index range scan on `M08B3_T_SKU_MVI` |
-| 1 | `json_exists(data, '$.items[*]?(@.sku.string() == $B0)')`, `SKU-RARE` | 6 | 0.01 to 0.02 | the same index |
-| 3 | `select sku, sum(qty) from m08b3_lines group by sku` | 878 | 7.0 to 7.5 | full scan of `M08B3_LINES`, hash group by |
-| 3 | `select ... from m08b3_lines where sku = 'SKU-RARE'` | 6 | 0.002 to 0.007 | index range scan on `M08B3_LINES_SKU_IX` |
+| 1 | the API's `status` predicate, `json_exists(data, '$?(@.status.stringOnly() == $B0)')`, on `M08B3_ORDERS_T` | 1,517 to 1,518 | 9.5 to 10.1 | full scan |
+| 1 | `json_value(data, '$.status') = 'open'` on `M08B3_ORDERS_T` | 1,517 to 1,518 | 3.8 to 5.9 | full scan (the function index is not chosen for 10% of the rows) |
+| 1 | the API's `items.sku` predicate on `M08B3_ORDERS_T`, `SKU-RARE` | 6 | 0.01 to 0.02 | multivalue index range scan on `M08B3_T_SKU_MVI` |
+| 1 | `json_exists(data, '$.items[*]?(@.sku.string() == $B0)')`, `SKU-RARE` | 6 | 0.01 to 0.04 | the same index |
+| 3 | `select sku, sum(qty) from m08b3_lines group by sku` | 878 | 6.8 to 7.1 | full scan of `M08B3_LINES`, hash group by |
+| 3 | `select ... from m08b3_lines where sku = 'SKU-RARE'` | 6 | 0.002 to 0.003 | index range scan on `M08B3_LINES_SKU_IX` |
 
 **Plain reading.**
 
 - **No statement is cheaper at any later stage than on the plain collection.**
   The best any of them does is tie (`byid` at stages 1 and 2: the same 3
   reads, CPU under 0.1 ms per call). `agg-unwind` at stages 1 and 2 is mixed:
-  about 4% fewer reads (1,577 to 1,508), but about 60% more CPU.
+  about 4 to 8% fewer reads (1,508 against 1,577 to 1,634), but about 60% more
+  CPU.
 - **Stage 0 to 1, the day-one cost of putting a view in front: four of six
-  statements got slower on both reads and CPU; `agg-unwind` is mixed (about 4%
-  fewer reads, 1,577 to 1,508, but about 60% more CPU, about 1.5 to about 2.3
-  seconds); `byid` stayed the same.** On this build, MongoDB API
+  statements got slower on both reads and CPU; `agg-unwind` is mixed (about 4 to 8%
+  fewer reads, 1,577 to 1,634 down to 1,508, but about 60% more CPU, about 1.5
+  to about 2.4 seconds); `byid` stayed the same.** On this build, MongoDB API
   filters on fields stored in the flex column are applied to the constructed
   document and cannot use indexes on the underlying column; fields mapped to
   real columns (here only `_id`) are pushed down. The executed plan is a full
@@ -1425,19 +1439,20 @@ app statements):
   same as the collection, against 1,508 through the view. For `status` the
   direct control also scans the table (the optimizer does not pick the
   function index for 10% of the rows), so there the view adds CPU, not reads:
-  about 10 ms direct against about 470 ms through the view, for about the
-  same reads (1,516 to 1,528).
+  about 10 ms direct against about 460 ms through the view, for about the
+  same reads (1,517 to 1,528).
 - **Stage 1 to 2: `status` and `agg-status` got cheaper; the other four stayed
   the same.** With `status` a real column, the filter is pushed down to
   `"T"."STATUS"=:1`, so no document is built to test it. CPU falls about
-  tenfold (about 470 to about 47 ms, and about 475 to 57 ms). Reads do not change: even with a
+  tenfold (`status` from about 460 ms to 44 to 51 ms, `agg-status` from
+  about 465 ms to about 57 ms). Reads do not change: even with a
   frequency histogram on `status`, the optimizer scans the table rather than
   use the B-tree for 2,057 of 20,000 rows. A covering B-tree on
   `(status, customer)` for `agg-status` was tried by hand: its plan stayed a
   full scan, because the generated SQL reads the whole document (`DATA`) from
   the view, so it was not kept.
 - **Stage 2 to 3: `sku-rare` got cheaper on both; `sku-hot` is mixed (CPU
-  down, about 490 to about 107 ms; reads up, about 1,534 to about 9,940); the
+  down, about 490 to about 105 ms; reads up, about 1,530 to about 9,925); the
   other four got slower.** The executed plans account for every read (their
   per-step buffer counts come from one earlier plan-capture run, so totals can
   differ from the table by a few reads for small counts and about 1% for large
@@ -1449,20 +1464,20 @@ app statements):
     reads each), so the total is 30 reads, against 1,508 at stage 2 and 6 on
     the collection. `sku-hot` becomes a hash semi-join of full scans of the
     lines (878) and the orders (1,535), plus the two lookups for 2,795 orders
-    (3,785 each): about 9,940 reads, but about 107 ms of CPU against about 490.
+    (3,785 each): about 9,910 to 9,940 reads, but about 105 ms of CPU against
+    about 490.
   - `byid` and `status` now build each order's `items` from the lines table,
-    with the same two lookups per order: `byid` 3 + 3 + 3 = 9 reads (11 on a
-    freshly built database); `status`
+    with the same two lookups per order: `byid` 3 + 3 + 3 = 9 reads; `status`
     1,528 for the scan plus 2 x 2,927 for 2,057 orders.
   - `agg-status` lost the `status` pushdown it had at stage 2. Its `FILTER`
     tests `JSON_EXISTS2` on a document that includes the lines subquery, so
     the lines lookup runs for all 20,000 orders (15,841 reads), plus 2,894 for
-    the 2,057 matches and 1,508 for the scan: about 20,100 to 20,350 reads, 1.1
+    the 2,057 matches and 1,508 for the scan: about 20,140 to 20,320 reads, 1.1
     seconds.
   - `agg-unwind` is not pushed down to a `GROUP BY` on `M08B3_LINES`. The plan
     scans the orders (1,508 reads) and runs `JSON EXPAND ARRAY EVALUATION`
     20,000 times over the built `items` arrays, which reads each order's lines
-    (15,842): about 17,200 to 17,500 reads, 3.4 seconds. The same answer in SQL straight
+    (15,842): about 17,220 to 17,420 reads, 3.4 to 3.5 seconds. The same answer in SQL straight
     against the lines table (control) reads 878 blocks in 7 ms.
 
 So the app keeps working, unchanged, at every stage, and gets the same results
@@ -1518,9 +1533,9 @@ Metrics: `s3b-<statement>-stage<N>-gets`, `-cpu-us` and `-ela-us` (per call;
 CPU and elapsed in microseconds) for the six statements and four stages; the
 same for the controls as `s3b-ctl-<control>-stage<N>-...`; and
 `s3b-stage<N>-hist-<index>` (1 if the index's column has a histogram).
-Large read counts repeat within about 1 to 2% from run to run. Small counts can
-move by a few reads, mostly on a freshly built database (`byid` at stage 3: 9
-in three runs, 11 on the fresh one). CPU and elapsed time are noisy on this
+Large read counts repeat within about 1% from run to run, with one exception:
+`agg-unwind` at stage 0 read 1,634 in one run against 1,577 in the other
+three. Small counts can move by a few reads. CPU and elapsed time are noisy on this
 shared container, so read them as sizes, not exact values.
 
 The executed plans need two grants beyond the earlier ones, in
@@ -1553,14 +1568,11 @@ statements are also listed from `v$sql` (executions, rows and buffer gets per
 call, with their text) as `wr-vs-*` metrics and `PLAN` rows. The session CPU
 statistic is at or below 1 centisecond for nearly every write here, so CPU is
 also taken in microseconds from `v$sql` (table 6 below). The executed plan of
-every measured statement is printed as `PLAN` rows. The reads and redo figures
-in tables 1 to 5 are ranges over six validator runs: four on the earlier
-scripts (three back to back and one on a freshly built database) and two on
-the current scripts, which add 100 timed runs after the 20 counted ones. A
-range ("21 to 24") means the runs differed, a single figure means all six
-agreed. Large read counts repeat within about 1%; redo moves by up to about
-10% on the small figures (row-by-row insert at k = 10: 7,988 to 8,800 bytes);
-small read counts move by a few in any run.
+every measured statement is printed as `PLAN` rows. Every figure is a range
+over the four runs: a range ("21 to 24") means the runs differed, a single
+figure means all four agreed. Large read counts repeat within about 2%; redo medians move by up to
+about 9% (the positional knob-3 change: 27,592 to 30,024 bytes); small read
+counts move by a few in any run.
 
 **The indexes are not the same on both sides.** The collection has one index,
 on `_id`. The orders and lines tables have a primary key each and an index on
@@ -1577,17 +1589,17 @@ so every insert lands at the right edge of the indexes.
 
 | k | collection: reads / redo | duality view | plain SQL, array | plain SQL, row by row |
 |---|---|---|---|---|
-| 10 | 6 / 1,276 to 1,332 | 98 to 102 / 7,988 to 8,012 | 15 / 2,572 to 2,628 | 75 to 76 / 7,988 to 8,800 |
-| 100 | 7 to 8 / 3,908 | 918 to 923 / 76,672 to 78,084 | 19 to 22 / 10,864 to 11,052 | 716 to 719 / 77,156 to 78,104 |
+| 10 | 6 / 1,288 to 1,332 | 98 / 7,988 to 8,044 | 15 / 2,584 to 2,628 | 76 / 7,988 to 8,016 |
+| 100 | 8 / 3,908 | 918 to 920 / 76,672 to 76,812 | 18 to 21 / 10,864 to 10,984 | 716 to 717 / 77,984 to 78,028 |
 
 The document insert is one row and one index entry, so it is the cheapest.
 The array insert keeps the plain SQL lines to about 100 bytes of redo each.
 The duality view costs about what the row-by-row SQL insert costs, and no less
-in reads: about 28% more reads (918 to 923 against 716 to 719) and about the
-same redo at k = 100 (within about 1%, lower in some runs and higher in others). Yet `v$sql` shows the
+in reads: about 28% more reads (918 to 920 against 716 to 717) and about 2%
+less redo at k = 100 (76,672 to 76,812 against 77,984 to 78,028 bytes). Yet `v$sql` shows the
 view sending its lines as one statement per document
 (`wr-vs-ins-dv-k100-insert-line-execs-per-call` = 1, rows per call
-100, 725 to 739 gets per call). That statement
+100, 727 to 729 gets per call). That statement
 returns each row's etag (`RETURNING ... sys_row_etag(...)`), and it is
 processed at row-by-row cost, not at array cost. These numbers do not show
 why. Writing through the view is the convenient path, not the cheap one, and
@@ -1602,11 +1614,11 @@ change has the same length.
 
 | Path | Reads | Redo (bytes) |
 |---|---|---|
-| collection, `JSON_TRANSFORM`, line found by `lineId` | 31 to 34 | 27,592 to 27,944 |
-| collection, `JSON_TRANSFORM` by position (`$.lines[499]`) | 31 to 34 | 27,592 to 28,384 |
-| collection, whole document replaced | 21 to 24 | 27,444 to 29,396 |
-| duality view, the `lineId` `JSON_TRANSFORM` | 28 to 31 | 588 to 612 |
-| lines table, one-row `UPDATE` | 5 to 6 | 588 to 612 |
+| collection, `JSON_TRANSFORM`, line found by `lineId` | 31 to 33 | 27,592 to 27,604 |
+| collection, `JSON_TRANSFORM` by position (`$.lines[499]`) | 31 to 34 | 27,592 to 30,024 |
+| collection, whole document replaced | 23 to 24 | 29,440 to 29,836 |
+| duality view, the `lineId` `JSON_TRANSFORM` | 29 to 31 | 588 |
+| lines table, one-row `UPDATE` | 6 | 588 |
 
 The duality view writes exactly what the one-row `UPDATE` writes (the same
 redo in each run), because it changes only the line row whose value changed:
@@ -1619,7 +1631,7 @@ and about the same as replacing the whole document: on this stack, with this
 out-of-row document, `JSON_TRANSFORM` did not make a smaller, partial update.
 That is knob 3 in one line: a small change to a large embedded document pays
 for the document's size, not the change's. A few collection runs cost far
-more (up to 899 reads and 322,632 bytes of redo across the six runs), probably LOB space
+more (up to 877 reads and 322,180 bytes of redo across the four runs), probably LOB space
 management (not checked); the median ignores them.
 
 **3. The same change through the MongoDB API** (`71`): `updateOne` with a
@@ -1633,8 +1645,8 @@ and after):
 
 | Target | Statements per call (gets each) | Reads (session) | Redo (session) |
 |---|---|---|---|
-| collection | select for update (15.0 to 16.0), document update (17.1 to 43.3) | 36.1 to 64.8 | 39,418 to 54,436 |
-| duality view | select for update (2,049.3 to 2,052.8), two etag reads (10 to 12, 14 to 17), line update (4.0 to 4.3), view update (44.0 to 51.3) | 2,094.4 to 2,104.9 | 223,774 to 225,030 |
+| collection | select for update (15.0), document update (17.1 to 65.9) | 35.1 to 86.8 | 39,418 to 54,339 |
+| duality view | select for update (2,050.0 to 2,051.0), two etag reads (10 to 11, 14 to 16), line update (4.0 to 4.1), view update (44.1 to 48.0) | 2,095.6 to 2,100.0 | 223,772 to 224,926 |
 
 The duality view still changes only one line row, but the API's read with
 `FOR UPDATE` locks every row of the order. `70` measures that read alone in
@@ -1642,8 +1654,8 @@ SQL, with its `COMMIT`:
 
 | `SELECT ... FOR UPDATE` of order 1 | Reads | Redo (bytes) | Undo records (about one per locked row) |
 |---|---|---|---|
-| collection | 7 to 8 | 548 to 572 | 1 |
-| duality view | 1,038 to 1,039 | 223,544 to 225,732 | 1,002 |
+| collection | 8 | 548 | 1 |
+| duality view | 1,038 to 1,039 | 223,544 | 1,002 |
 
 On the view, the read locks the order row and all 1,000 line rows, and each
 lock writes redo: that is most of the API's redo for the view. That is 1,001
@@ -1651,12 +1663,13 @@ locked rows and 1,002 undo records, so the count is about one per locked row,
 not exactly one; the extra record was not traced. The undo count is read from
 `v$transaction` before the `COMMIT`, inside the measured window, so the reads
 of that small query are part of both rows' figures. Through SQL the
-same change cost 28 to 31 reads and 588 to 612 bytes. The API's read-modify-write is
-the cost here, not the view. On the collection, in five of the six runs, the API wrote about twice
-the redo of the SQL whole-document replace (54,116 to 54,436 against 27,444
-to 29,396), although its lock costs little and its write is one statement.
-In one run it wrote 39,418, with the document update at 17.1 gets per
-call instead of about 43. Neither difference is explained. An app that changes one
+same change cost 29 to 31 reads and 588 bytes. The API's read-modify-write is
+the cost here, not the view. On the collection, in two of the four runs, the API
+wrote about 1.8 times the redo of the SQL whole-document replace (54,054 to
+54,339 against 29,440 to 29,836), with the document update at 47.8 to 65.9
+gets per call, although its lock costs little and its write is one
+statement. In the other two runs it wrote 39,418 to 39,714, with the document
+update at 17.1 to 17.2 gets per call. Neither difference is explained. An app that changes one
 line of a large order will do better with SQL (`JSON_TRANSFORM` through the
 view, or a row update) than with a positional `$set`.
 
@@ -1669,8 +1682,7 @@ view, and reads the order documents again.
 - All 5 of customer 1's order documents have a new etag
   (`wr-s4d-etags-changed`); customer 2's 3 orders do not
   (`wr-s4d-other-etags-changed` = 0). The rename itself wrote one row
-  (768 bytes of redo, commit included; 39 reads in three of the six runs and
-  84 to 86 in the other three).
+  (768 bytes of redo and 84 to 86 reads, commit included).
 - A write to order 1 with the etag read before the rename is refused with the
   etag mismatch error (`wr-s4d-stale-write-rejected` = 1), and changes
   nothing.
@@ -1702,22 +1714,21 @@ tier, and customer 1's tier changes, three ways:
   as the documentation advises.
 
 The normalized tier change was measured before the logs existed, so it pays
-no log cost. The MV starts with customer 1 at SILVER; its tier changes (21 on
-the earlier scripts, 121 on the current ones)
-start with GOLD, and after every `COMMIT` the script checks that all 100 of
+no log cost. The MV starts with customer 1 at SILVER; its 121 tier changes (a
+warm-up, 20 counted and 100 CPU runs) start with GOLD, and after every `COMMIT` the script checks that all 100 of
 customer 1's MV rows show the new tier (checked: every one).
 
 | Arm | Order read: reads | Tier change + COMMIT: rows | reads | redo (bytes) |
 |---|---|---|---|---|
 | embedded | 3 | 100 documents | 1,001 | 157,444 |
-| normalized (join) | 6 | 1 row | 5 to 6 | 600 to 624 |
-| materialized view | 3 | 1 row, then 100 view rows at COMMIT | 1,974 to 1,997 | 177,672 to 177,892 |
+| normalized (join) | 6 | 1 row | 6 | 600 |
+| materialized view | 3 | 1 row, then 100 view rows at COMMIT | 1,981 to 2,010 | 177,796 to 178,476 |
 
 The materialized view reads like the embedded document (one index probe and
 one row) and stays correct after every `COMMIT`. But it moves the fan-out, it
 does not remove it. Per `COMMIT`, `v$sql` shows the refresh deleting customer
-1's 100 view rows (786.9 to 789.6 gets) and inserting 100 new ones
-(870.5 to 890.4 gets), plus the log row written and cleared. That costs more reads
+1's 100 view rows (787.1 to 790.3 gets) and inserting 100 new ones
+(870.3 to 898.2 gets), plus the log row written and cleared. That costs more reads
 and more redo than updating the 100 embedded copies directly. The database
 keeps the copy in sync, so the app cannot forget a copy, and the cost of the
 copy is still paid on every change. Only the normalized form pays for the
@@ -1729,58 +1740,59 @@ write's own statements, divided by 100 (about 10 microseconds per run of
 resolution; see the harness). No parse is counted. A write through a duality view or
 with an MV log runs its internal statements inside the write, and they are
 part of its figure; the `v$sql` buffer gets of the view writes match their
-session logical reads (`wr-ins-dv-k100-gets` 932 to 936 against 918 to 919 reads), so
+session logical reads (`wr-ins-dv-k100-gets` 933 to 937 against 918 to 920 reads), so
 the figure includes them. The `COMMIT` is not a statement, so it is not in
 these figures, but each statement's undo and redo generation is. The
 materialized view's refresh runs inside the `COMMIT`; its statements are
 listed separately (`wr-vs-mv-refresh-<statement>-us-per-call`) and added to
 the update in `wr-mv-upd-mv-total-us`. The three order reads of part 5 are
 timed with `measure_us` (200 runs). Reads and redo are in tables 1 to 5; this
-table gives CPU and elapsed only, over the two runs on the current scripts.
+table gives CPU and elapsed only, over the four runs.
 
 | write or read | k | CPU us | elapsed us |
 |---|---|---|---|
-| insert, collection | 10 | 38 to 43 | 39 to 43 |
-| insert, collection | 100 | 51 to 55 | 51 to 56 |
-| insert, duality view | 10 | 117 to 123 | 120 to 126 |
-| insert, duality view | 100 | 751 to 826 | 756 to 2,336 |
-| insert, plain SQL array | 10 | 39 to 49 | 39 to 50 |
-| insert, plain SQL array | 100 | 157 to 158 | 158 to 162 |
-| insert, plain SQL row by row | 10 | 77 to 111 | 78 to 112 |
-| insert, plain SQL row by row | 100 | 781 to 812 | 10,287 to 15,417 |
-| knob 3, collection, by lineId | | 854 to 905 | 854 to 894 |
-| knob 3, collection, by position | | 730 to 776 | 1,116 to 1,255 |
-| knob 3, collection, whole document | | 104 to 106 | 104 to 1,748 |
-| knob 3, duality view | | 2,995 to 3,006 | 2,924 to 2,996 |
-| knob 3, lines table | | 10 to 21 | 10 to 21 |
-| SELECT FOR UPDATE, collection | | 19 to 20 | 19 to 20 |
-| SELECT FOR UPDATE, duality view | | 6,280 to 6,543 | 8,962 to 14,175 |
-| tier change, embedded | | 2,759 to 2,804 | 4,437 to 9,298 |
+| insert, collection | 10 | 37 to 43 | 37 to 43 |
+| insert, collection | 100 | 49 to 54 | 49 to 54 |
+| insert, duality view | 10 | 120 to 159 | 120 to 193 |
+| insert, duality view | 100 | 733 to 969 | 737 to 2,156 |
+| insert, plain SQL array | 10 | 38 to 64 | 38 to 66 |
+| insert, plain SQL array | 100 | 144 to 159 | 144 to 160 |
+| insert, plain SQL row by row | 10 | 75 to 80 | 75 to 80 |
+| insert, plain SQL row by row | 100 | 749 to 777 | 758 to 22,294 |
+| knob 3, collection, by lineId | | 856 to 865 | 848 to 894 |
+| knob 3, collection, by position | | 707 to 768 | 1,143 to 1,521 |
+| knob 3, collection, whole document | | 106 to 113 | 668 to 2,654 |
+| knob 3, duality view | | 2,882 to 3,081 | 2,918 to 3,088 |
+| knob 3, lines table | | 10 to 18 | 10 to 18 |
+| SELECT FOR UPDATE, collection | | 20 to 27 | 20 to 27 |
+| SELECT FOR UPDATE, duality view | | 6,346 to 6,431 | 8,659 to 10,293 |
+| tier change, embedded | | 2,739 to 2,855 | 4,482 to 4,851 |
 | tier change, normalized | | 11 | 11 |
-| tier change, materialized view (update only) | | 100 to 103 | 100 to 103 |
-| tier change, materialized view, with its refresh at COMMIT | | 6,891 to 6,900 | |
+| tier change, materialized view (update only) | | 97 to 105 | 97 to 105 |
+| tier change, materialized view, with its refresh at COMMIT | | 6,739 to 6,919 | |
 | order read, embedded | | 9 | 9 |
 | order read, normalized (join) | | 3 | 3 |
 | order read, materialized view | | 2 | 2 |
 
-- **Inserts.** At 100 lines the document insert uses the least CPU (51 to 55
+- **Inserts.** At 100 lines the document insert uses the least CPU (49 to 54
   microseconds). The array insert of the plain SQL rows uses about 3 times
-  that (157 to 158); the duality view and the row-by-row SQL insert use about
-  14 to 16 times (751 to 826 and 781 to 812), and those two overlap. At 10
-  lines the collection and the array insert overlap (38 to 49).
-- **Knob 3, one line in a 1,000-line order.** The row update uses 10 to 21
-  microseconds. The collection's `JSON_TRANSFORM` uses about 730 to 905, and
-  replacing the whole prepared document about 105. Through the duality view
-  the same change uses about 3,000 microseconds, about 150 to 300 times the row
-  update, although it writes exactly the row update's redo: the view rebuilds
-  the 1,000-line document to find the line.
-- **`SELECT ... FOR UPDATE`** of the order takes about 20 microseconds on the
-  collection and about 6,300 to 6,500 on the view, which locks 1,001 rows.
+  that (144 to 159); the duality view and the row-by-row SQL insert use about
+  14 to 20 times (733 to 969 and 749 to 777), and those two overlap. At 10
+  lines the collection and the array insert overlap (37 to 43 and 38 to 64).
+- **Knob 3, one line in a 1,000-line order.** The row update uses 10 to 18
+  microseconds. The collection's `JSON_TRANSFORM` uses about 710 to 870, and
+  replacing the whole prepared document about 105 to 115. Through the duality
+  view the same change uses about 2,900 to 3,100 microseconds, about 160 to
+  310 times the row update, although it writes exactly the row update's redo:
+  the view rebuilds the 1,000-line document to find the line.
+- **`SELECT ... FOR UPDATE`** of the order takes 20 to 27 microseconds on the
+  collection and about 6,350 to 6,430 on the view, which locks 1,001 rows.
 - **The materialized view.** The tier change itself uses about 100
-  microseconds, and its refresh at `COMMIT` about 6,800 more (deleting and
-  inserting customer 1's 100 view rows): about 6,900 in all, about 2.5 times
-  the CPU of updating the 100 embedded copies directly (about 2,800) and about
-  600 times the normalized update (11).
+  microseconds, and its refresh at `COMMIT` about 6,600 to 6,800 more
+  (deleting and inserting customer 1's 100 view rows): about 6,700 to 6,900
+  in all, about 2.4 to 2.5 times the CPU of updating the 100 embedded copies
+  directly (about 2,700 to 2,900) and about 610 to 630 times the normalized
+  update (11).
 - **The order read.** The normalized join (3 microseconds) and the
   materialized view (2) use less CPU than the embedded document (9), which is
   serialized to text.
@@ -1819,16 +1831,18 @@ ASSERT:wr-api-teardown-clean:PASS
   collection document, the duality-view document and the table rows (from
   both plain SQL paths) has the same customer, status, total, line count and
   lines (number, sku, qty).
-- `k3-change-visible`: each knob-3 path changed one row or document in each of
-  20 runs; the last value shows in the collection, the view and the lines
-  table; the line next to it is unchanged; both documents still have 1,000
-  lines; the view update landed in the line row; the positional path addressed
-  line 1500; and both `FOR UPDATE` arms ran 20 times.
+- `k3-change-visible`: each knob-3 path ran 121 times (a warm-up, 20 counted
+  runs and 100 CPU runs), recorded 20 counted samples, and its last run
+  changed one row or document; the last value shows in the collection, the
+  view and the lines table; the line next to it is unchanged; both documents
+  still have 1,000 lines; the view update landed in the line row; the
+  positional path addressed line 1500; and both `FOR UPDATE` arms recorded 20
+  counted samples (of 121 runs each).
 - `s4d-rename-visible`: the rename changed one customer document, all 5 order
   documents show the new name, and the etag results were recorded.
 - `s4d-etag-controls`: a fresh document is accepted and a document changed
   since it was read is refused with the etag error.
-- `mv-reflects-commit`: the MV started at SILVER, every one of the 21 tier
+- `mv-reflects-commit`: the MV started at SILVER, every one of the 121 tier
   changes showed on all 100 of customer 1's MV rows right after its `COMMIT`,
   and after the last (GOLD) the MV matches the tables; each arm changed the
   expected number of rows.
