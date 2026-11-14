@@ -38,8 +38,8 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant.** A crossover exists at every point. |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
-| S3 at scale (B) | `60` to `69` | "there is no data independence", and the hostile objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection.** On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
-| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the hostile objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and the MongoDB API's `$set` on a duality view locks every child row of the document** (1,001 rows to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. |
+| S3 at scale (B) | `60` to `69` | "there is no data independence", and the hostile objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
+| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the hostile objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about, and no less than, what row-by-row SQL costs (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -311,8 +311,9 @@ and k = 1,000 only, since smaller reads are below its one-centisecond
 resolution. On the lab container they are also below it at k = 1,000: the
 medians are 0 cs for every reader, so time does not separate them here.
 
-**What it shows.** Logical reads from one validator run on the lab container
-(the article takes its numbers from `validator/results.json`):
+**What it shows.** Logical reads, the same in all four validator runs (three
+back to back and one on a freshly built database; the article takes its
+numbers from `validator/results.json`):
 
 | k | doc | heap join | best of the other joins | best join vs doc |
 |---|---|---|---|---|
@@ -598,8 +599,9 @@ The crossover formula is S1b's, rounded to two decimals:
 q = 1000 * (join - doc) / (orderdocs - childtable)
 ```
 
-Logical reads from one validator run on the lab container (the article takes
-its numbers from `validator/results.json`):
+Logical reads over four validator runs, three back to back and one on a
+freshly built database. A range means the runs differed; the article takes
+its numbers from `validator/results.json`.
 
 | k | M | childtable | orderdocs | doc | join | crossover q (item queries per 1,000 order reads) |
 |---|---|---|---|---|---|---|
@@ -607,10 +609,10 @@ its numbers from `validator/results.json`):
 | 100 | 20 | 2 | 22 | 3 | 6 | 150 |
 | 100 | 100 | 2 | 102 | 3 | 6 | 30 |
 | 100 | 500 | 4 | 503 | 3 | 6 | 6.01 |
-| 1000 | 5 | 3 | 33 | 8 | 14 | 200 |
-| 1000 | 20 | 3 | 123 | 8 | 14 | 50 |
-| 1000 | 100 | 3 | 603 | 8 | 14 | 10 |
-| 1000 | 500 | 5 | 2649 | 8 | 14 | 2.27 |
+| 1000 | 5 | 3 | 33 | 8 | 14 to 15 | 200 to 233.33 |
+| 1000 | 20 | 3 | 123 | 8 | 14 to 15 | 50 to 58.33 |
+| 1000 | 100 | 3 | 603 | 8 | 14 to 15 | 10 to 11.67 |
+| 1000 | 500 | 5 | 2649 | 8 | 14 to 15 | 2.27 to 2.65 |
 
 The k = 1,000 join read was 14 in six validator runs and 15 in two (one of
 them the first run on a freshly built database). One read
@@ -648,7 +650,7 @@ plans (primary keys, covering indexes) and the cheaper counts; the embedded
 update has no hint, and the optimizer, which sees 1,000 rows for customer 3 in
 the histogram, still picks the `custId` index at every N. The crossover formula
 is S2's, on logical reads, with redo reported separately. The embedded update
-reads move by a few blocks from run to run (124 to 126 at N = 10), so the
+reads move by a few blocks from run to run (1,098 to 1,100 at N = 100), so the
 second decimal of the crossover is not stable:
 
 ```
@@ -657,17 +659,17 @@ q = 1000 * (norm_read - emb_read) / (emb_update_reads - norm_update_reads)
 
 | N | docs touched | embedded update reads | embedded update redo (bytes) | normalized update reads / redo | emb_read | norm_read | crossover q (tier changes per 1,000 order reads) |
 |---|---|---|---|---|---|---|---|
-| 10 | 10 | 124 | 13,904 | 7 / 784 | 3 | 4 | 8.55 |
-| 100 | 100 | 1,100 | 125,936 | 7 / 784 | 3 | 4 | 0.91 |
-| 1000 | 1,000 | 10,239 | 1,169,968 | 7 / 784 | 3 | 4 | 0.10 |
+| 10 | 10 | 126 | 13,972 | 7 / 784 | 3 | 4 | 8.40 |
+| 100 | 100 | 1,098 to 1,100 | 125,868 to 125,936 | 7 / 784 | 3 | 4 | 0.91 to 0.92 |
+| 1000 | 1,000 | 10,223 to 10,225 | 1,169,516 to 1,169,596 | 7 / 784 | 3 | 4 | 0.10 |
 
 **How strongly it depends on N: about in inverse proportion.** The embedded update
-costs about 10 to 12 reads and about 1,170 to 1,390 bytes of redo per embedded copy (more per copy at
+costs about 10 to 13 reads and about 1,170 to 1,400 bytes of redo per embedded copy (more per copy at
 smaller N), so
 its cost grows linearly with N, while the read advantage stays at one logical
 read (the customer index probe the embedded read skips) at every N. The
-crossover therefore falls as 1/N: about 8.5 tier changes per 1,000 order reads
-at N = 10, 0.91 at N = 100 (S2's 0.9) and 0.10 at N = 1,000. A customer with ten
+crossover therefore falls as 1/N: about 8.4 tier changes per 1,000 order reads
+at N = 10, 0.91 to 0.92 at N = 100 (S2's 0.9) and 0.10 at N = 1,000. A customer with ten
 times more orders can change its tier ten times less often before embedding
 stops paying. S2's number holds only at N = 100. What does not change is the
 direction: a crossover exists at every N.
@@ -677,11 +679,11 @@ they are from `m08_meter.measure_repeat` for the item readers at M = 100 and
 500; for the S2 sweep, from a loop of 20 embedded updates at N = 100 and 1,000,
 each committed after it is measured. Those loops also record
 `s2c-n{N}-embedded-update-timed-reads-median` for audit only: with a commit
-after every run its value moves widely between runs (8,840 and 11,521 at
-N = 1,000 in two validator runs), so the crossover uses the counted second
+after every run its value moves widely between runs (8,841 to 11,521 at
+N = 1,000 over four validator runs, the low one on a freshly built database), so the crossover uses the counted second
 execution, never this figure. At the meter's one-centisecond
 resolution the child table reads 0 cs everywhere, the order documents 2 cs at
-k = 100, M = 500 (1 to 2 cs) and 3 to 14 cs at k = 1,000, and the embedded update 0 cs at
+k = 100, M = 500 (1 to 2 cs) and 3 to 15 cs at k = 1,000, and the embedded update 0 cs at
 N = 100 and 3 cs at N = 1,000. Each timed copy runs the same plan as the
 counted cursor (`s1c-timed-same-plan`, `s2c-timed-same-plan`).
 
@@ -961,42 +963,42 @@ about 10% or under 0.1 ms per call, count as unchanged. A statement is
 when one goes up and the other does not go down, and *the same* when neither
 changes. When one goes down and the other up, the text names both.
 
-**Results** (from one validator run on the lab container; reruns move the
-reads by about 1%, and the article takes its numbers from
-`validator/results.json`). Logical reads per call, with CPU per call in
+**Results.** Ranges over four validator runs, three back to back and one on a
+freshly built database; the article takes its numbers from
+`validator/results.json`. Logical reads per call, with CPU per call in
 milliseconds in brackets:
 
 | Statement | Stage 0 (collection) | Stage 1 (view, JSON column) | Stage 2 (promoted columns) | Stage 3 (lines table) |
 |---|---|---|---|---|
-| `byid` | 3 (0.01) | 3 (0.05) | 3 (0.04) | 9 (0.06) |
-| `status` | 1,208 (2.8) | 1,524 (463) | 1,524 (46) | 7,394 (69) |
-| `sku-hot` | 1,389 (2.8) | 1,534 (493) | 1,534 (487) | 9,940 (106) |
-| `sku-rare` | 6 (0.01) | 1,508 (430) | 1,508 (422) | 30 (0.09) |
-| `agg-status` | 1,180 (12) | 1,508 (469) | 1,508 (57) | 20,154 (1,120) |
-| `agg-unwind` | 1,589 (1,477) | 1,508 (2,372) | 1,508 (2,373) | 17,254 (3,429) |
+| `byid` | 3 (0.01 to 0.02) | 3 (0.04 to 0.08) | 3 (0.04 to 0.08) | 9 to 11 (0.07 to 0.12) |
+| `status` | 1,199 to 1,204 (2.4 to 3.1) | 1,525 to 1,528 (464 to 475) | 1,525 to 1,528 (42 to 52) | 7,356 to 7,429 (69 to 81) |
+| `sku-hot` | 1,386 to 1,389 (2.7 to 3.1) | 1,532 to 1,535 (491 to 514) | 1,532 to 1,535 (484 to 495) | 9,933 to 9,952 (104 to 112) |
+| `sku-rare` | 6 to 7 (0.01 to 0.02) | 1,508 (427 to 431) | 1,508 (420 to 430) | 30 (0.08 to 0.12) |
+| `agg-status` | 1,173 (11.6 to 12.3) | 1,508 (470 to 481) | 1,508 (57) | 20,092 to 20,354 (1,110 to 1,129) |
+| `agg-unwind` | 1,577 (1,463 to 1,478) | 1,508 (2,322 to 2,383) | 1,508 (2,336 to 2,427) | 17,174 to 17,475 (3,382 to 3,401) |
 
-**Direct-SQL controls** (same run; SQL sent straight to the tables, not app
-statements):
+**Direct-SQL controls** (same four runs; SQL sent straight to the tables, not
+app statements):
 
 | Stage | Control | Reads per call | CPU ms | Executed plan |
 |---|---|---|---|---|
-| 1 | the API's `status` predicate, `json_exists(data, '$?(@.status.stringOnly() == $B0)')`, on `M08B3_ORDERS_T` | 1,518 | 9.4 | full scan |
-| 1 | `json_value(data, '$.status') = 'open'` on `M08B3_ORDERS_T` | 1,518 | 4.9 | full scan (the function index is not chosen for 10% of the rows) |
-| 1 | the API's `items.sku` predicate on `M08B3_ORDERS_T`, `SKU-RARE` | 6 | 0.01 | multivalue index range scan on `M08B3_T_SKU_MVI` |
-| 1 | `json_exists(data, '$.items[*]?(@.sku.string() == $B0)')`, `SKU-RARE` | 6 | 0.01 | the same index |
-| 3 | `select sku, sum(qty) from m08b3_lines group by sku` | 878 | 6.9 | full scan of `M08B3_LINES`, hash group by |
-| 3 | `select ... from m08b3_lines where sku = 'SKU-RARE'` | 6 | 0.003 | index range scan on `M08B3_LINES_SKU_IX` |
+| 1 | the API's `status` predicate, `json_exists(data, '$?(@.status.stringOnly() == $B0)')`, on `M08B3_ORDERS_T` | 1,516 to 1,518 | 9.6 to 11.2 | full scan |
+| 1 | `json_value(data, '$.status') = 'open'` on `M08B3_ORDERS_T` | 1,516 to 1,518 | 5.0 to 5.7 | full scan (the function index is not chosen for 10% of the rows) |
+| 1 | the API's `items.sku` predicate on `M08B3_ORDERS_T`, `SKU-RARE` | 6 | 0.01 to 0.04 | multivalue index range scan on `M08B3_T_SKU_MVI` |
+| 1 | `json_exists(data, '$.items[*]?(@.sku.string() == $B0)')`, `SKU-RARE` | 6 | 0.01 to 0.02 | the same index |
+| 3 | `select sku, sum(qty) from m08b3_lines group by sku` | 878 | 7.0 to 7.5 | full scan of `M08B3_LINES`, hash group by |
+| 3 | `select ... from m08b3_lines where sku = 'SKU-RARE'` | 6 | 0.002 to 0.007 | index range scan on `M08B3_LINES_SKU_IX` |
 
 **Plain reading.**
 
 - **No statement is cheaper at any later stage than on the plain collection.**
   The best any of them does is tie (`byid` at stages 1 and 2: the same 3
   reads, CPU under 0.1 ms per call). `agg-unwind` at stages 1 and 2 is mixed:
-  about 5% fewer reads, but about 60% more CPU.
+  about 4% fewer reads (1,577 to 1,508), but about 60% more CPU.
 - **Stage 0 to 1, the day-one cost of putting a view in front: four of six
-  statements got slower on both reads and CPU; `agg-unwind` read about the same
-  (1,589 to 1,508, 5% fewer) but its CPU went up (1.5 to 2.4 seconds); `byid`
-  stayed the same.** On this build, MongoDB API
+  statements got slower on both reads and CPU; `agg-unwind` is mixed (about 4%
+  fewer reads, 1,577 to 1,508, but about 60% more CPU, about 1.5 to about 2.3
+  seconds); `byid` stayed the same.** On this build, MongoDB API
   filters on fields stored in the flex column are applied to the constructed
   document and cannot use indexes on the underlying column; fields mapped to
   real columns (here only `_id`) are pushed down. The executed plan is a full
@@ -1007,22 +1009,23 @@ statements):
   same as the collection, against 1,508 through the view. For `status` the
   direct control also scans the table (the optimizer does not pick the
   function index for 10% of the rows), so there the view adds CPU, not reads:
-  9 ms direct against 463 ms through the view, for the same 1,518 to 1,524
-  reads.
+  about 10 ms direct against about 470 ms through the view, for about the
+  same reads (1,516 to 1,528).
 - **Stage 1 to 2: `status` and `agg-status` got cheaper; the other four stayed
   the same.** With `status` a real column, the filter is pushed down to
   `"T"."STATUS"=:1`, so no document is built to test it. CPU falls about
-  tenfold (463 to 46 ms, 469 to 57 ms). Reads do not change: even with a
+  tenfold (about 470 to about 47 ms, and about 475 to 57 ms). Reads do not change: even with a
   frequency histogram on `status`, the optimizer scans the table rather than
   use the B-tree for 2,057 of 20,000 rows. A covering B-tree on
   `(status, customer)` for `agg-status` was tried by hand: its plan stayed a
   full scan, because the generated SQL reads the whole document (`DATA`) from
   the view, so it was not kept.
 - **Stage 2 to 3: `sku-rare` got cheaper on both; `sku-hot` is mixed (CPU
-  down, 487 to 106 ms, reads up, 1,534 to 9,940); the other four got
-  slower.** The executed plans account for every read (their per-step buffer
-  counts come from the plan-capture run, so totals can differ from the table
-  by up to 1%):
+  down, about 490 to about 107 ms; reads up, about 1,534 to about 9,940); the
+  other four got slower.** The executed plans account for every read (their
+  per-step buffer counts come from one earlier plan-capture run, so totals can
+  differ from the table by a few reads for small counts and about 1% for large
+  ones):
   - `items.sku` is now pushed down to the lines table. `sku-rare` uses the
     `sku` B-tree (6 reads), then the order's primary key (8), then builds each
     of the 3 documents' `items` array from `M08B3_LINES_ORDER_IX`. That last
@@ -1030,18 +1033,20 @@ statements):
     reads each), so the total is 30 reads, against 1,508 at stage 2 and 6 on
     the collection. `sku-hot` becomes a hash semi-join of full scans of the
     lines (878) and the orders (1,535), plus the two lookups for 2,795 orders
-    (3,785 each): 9,940 reads, but 106 ms of CPU against 487.
+    (3,785 each): about 9,940 reads, but about 107 ms of CPU against about 490.
   - `byid` and `status` now build each order's `items` from the lines table,
-    with the same two lookups per order: `byid` 3 + 3 + 3 = 9 reads; `status`
+    with the same two lookups per order: `byid` 3 + 3 + 3 = 9 reads (11 on a
+    freshly built database); `status`
     1,528 for the scan plus 2 x 2,927 for 2,057 orders.
   - `agg-status` lost the `status` pushdown it had at stage 2. Its `FILTER`
     tests `JSON_EXISTS2` on a document that includes the lines subquery, so
     the lines lookup runs for all 20,000 orders (15,841 reads), plus 2,894 for
-    the 2,057 matches and 1,508 for the scan: 20,154 reads, 1.1 seconds.
+    the 2,057 matches and 1,508 for the scan: about 20,100 to 20,350 reads, 1.1
+    seconds.
   - `agg-unwind` is not pushed down to a `GROUP BY` on `M08B3_LINES`. The plan
     scans the orders (1,508 reads) and runs `JSON EXPAND ARRAY EVALUATION`
     20,000 times over the built `items` arrays, which reads each order's lines
-    (15,842): 17,254 reads, 3.4 seconds. The same answer in SQL straight
+    (15,842): about 17,200 to 17,500 reads, 3.4 seconds. The same answer in SQL straight
     against the lines table (control) reads 878 blocks in 7 ms.
 
 So the app keeps working, unchanged, at every stage, and gets the same results
@@ -1097,8 +1102,10 @@ Metrics: `s3b-<statement>-stage<N>-gets`, `-cpu-us` and `-ela-us` (per call;
 CPU and elapsed in microseconds) for the six statements and four stages; the
 same for the controls as `s3b-ctl-<control>-stage<N>-...`; and
 `s3b-stage<N>-hist-<index>` (1 if the index's column has a histogram).
-Logical reads repeat within about 1% from run to run; CPU and elapsed time are
-noisy on this shared container, so read them as sizes, not exact values.
+Large read counts repeat within about 1% from run to run. Small counts can
+move by a few reads, mostly on a freshly built database (`byid` at stage 3: 9
+in three runs, 11 on the fresh one). CPU and elapsed time are noisy on this
+shared container, so read them as sizes, not exact values.
 
 The executed plans need two grants beyond the earlier ones, in
 `docker/init/01-lab-user.sql`: `SELECT` on `V_$SQL_PLAN_STATISTICS_ALL` (read
@@ -1130,11 +1137,11 @@ statements are also listed from `v$sql` (executions, rows and buffer gets per
 call, with their text) as `wr-vs-*` metrics and `PLAN` rows. CPU is at or
 below 1 centisecond for nearly every write here, so it does not separate them;
 reads and redo do. The executed plan of every measured statement is printed as
-`PLAN` rows. The figures are from two validator runs: a range ("21 to 24")
-means the runs differed, a single figure means they agreed. The exception is
-the per-statement `v$sql` figures quoted in the text (gets per call of one
-statement, such as "730.7 gets per call"): those are from the first of the two
-runs only.
+`PLAN` rows. The figures are ranges over four validator runs, three back to
+back and one on a freshly built database: a range ("21 to 24") means the runs differed, a single figure
+means all four agreed. Large read counts repeat within about 1%; small counts
+can move by a few reads, mostly on the freshly built database; redo moves by
+1 to 2%.
 
 **The indexes are not the same on both sides.** The collection has one index,
 on `_id`. The orders and lines tables have a primary key each and an index on
@@ -1151,16 +1158,17 @@ so every insert lands at the right edge of the indexes.
 
 | k | collection: reads / redo | duality view | plain SQL, array | plain SQL, row by row |
 |---|---|---|---|---|
-| 10 | 6 / 1,332 | 98 / 7,988 to 8,044 | 15 / 2,572 | 76 / 7,988 to 8,000 |
-| 100 | 8 / 3,908 | 920 / 76,812 to 77,984 | 21 to 24 / 11,044 to 11,120 | 717 to 719 / 77,156 to 78,104 |
+| 10 | 6 / 1,276 to 1,332 | 98 to 102 / 7,988 to 8,012 | 15 / 2,572 to 2,628 | 76 / 7,988 to 8,044 |
+| 100 | 8 / 3,908 | 919 to 923 / 76,672 to 77,920 | 21 to 22 / 10,980 to 11,052 | 717 to 719 / 77,156 to 78,104 |
 
 The document insert is one row and one index entry, so it is the cheapest.
 The array insert keeps the plain SQL lines to about 100 bytes of redo each.
-The duality view costs about what the row-by-row SQL insert costs: within
-about 30% on reads and a few percent on redo at k = 100. Yet `v$sql` shows the
+The duality view costs about, and no less than, what the row-by-row SQL
+insert costs: about 28% more reads (919 to 923 against 717 to 719) and about
+the same redo at k = 100. Yet `v$sql` shows the
 view sending its lines as one statement per document
 (`wr-vs-ins-dv-k100-insert-line-execs-per-call` = 1, rows per call
-100, 730.7 gets per call). That statement
+100, 725 to 739 gets per call). That statement
 returns each row's etag (`RETURNING ... sys_row_etag(...)`), and it is
 processed at row-by-row cost, not at array cost. These numbers do not show
 why. Writing through the view is the convenient path, not the cheap one, and
@@ -1175,11 +1183,11 @@ change has the same length.
 
 | Path | Reads | Redo (bytes) |
 |---|---|---|
-| collection, `JSON_TRANSFORM`, line found by `lineId` | 31 to 33 | 27,592 to 27,604 |
-| collection, `JSON_TRANSFORM` by position (`$.lines[499]`) | 31 to 34 | 27,592 to 28,064 |
-| collection, whole document replaced | 21 to 24 | 27,444 to 28,440 |
-| duality view, the `lineId` `JSON_TRANSFORM` | 29 | 588 |
-| lines table, one-row `UPDATE` | 6 | 588 |
+| collection, `JSON_TRANSFORM`, line found by `lineId` | 31 to 34 | 27,592 to 27,944 |
+| collection, `JSON_TRANSFORM` by position (`$.lines[499]`) | 31 to 34 | 27,592 to 28,384 |
+| collection, whole document replaced | 21 to 24 | 27,444 to 28,420 |
+| duality view, the `lineId` `JSON_TRANSFORM` | 28 to 29 | 588 to 612 |
+| lines table, one-row `UPDATE` | 5 to 6 | 588 to 612 |
 
 The duality view writes exactly what the one-row `UPDATE` writes (the same
 redo in each run), because it changes only the line row whose value changed:
@@ -1192,7 +1200,7 @@ and about the same as replacing the whole document: on this stack, with this
 out-of-row document, `JSON_TRANSFORM` did not make a smaller, partial update.
 That is knob 3 in one line: a small change to a large embedded document pays
 for the document's size, not the change's. A few collection runs cost far
-more (in one run, up to 553 reads and 322,700 bytes of redo), probably LOB space
+more (up to 899 reads and 322,632 bytes of redo across the four runs), probably LOB space
 management (not checked); the median ignores them.
 
 **3. The same change through the MongoDB API** (`71`): `updateOne` with a
@@ -1206,8 +1214,8 @@ and after):
 
 | Target | Statements per call (gets each) | Reads (session) | Redo (session) |
 |---|---|---|---|
-| collection | select for update (15.4), document update (42.8) | 61.2 to 62.5 | 54,120 to 54,143 |
-| duality view | select for update (2,052.2), two etag reads (12, 17), line update (4), view update (51) | 2,093.5 to 2,104.2 | 223,776 to 223,792 |
+| collection | select for update (15.0 to 16.0), document update (17.1 to 43.3) | 36.1 to 64.8 | 39,418 to 54,436 |
+| duality view | select for update (2,052.1 to 2,052.8), two etag reads (12, 17), line update (4.0 to 4.3), view update (51.0 to 51.3) | 2,104.1 to 2,104.9 | 223,774 to 225,030 |
 
 The duality view still changes only one line row, but the API's read with
 `FOR UPDATE` locks every row of the order. `70` measures that read alone in
@@ -1215,7 +1223,7 @@ SQL, with its `COMMIT`:
 
 | `SELECT ... FOR UPDATE` of order 1 | Reads | Redo (bytes) | Undo records (about one per locked row) |
 |---|---|---|---|
-| collection | 8 | 548 | 1 |
+| collection | 7 to 8 | 548 to 572 | 1 |
 | duality view | 1,038 | 223,544 | 1,002 |
 
 On the view, the read locks the order row and all 1,000 line rows, and each
@@ -1224,11 +1232,12 @@ locked rows and 1,002 undo records, so the count is about one per locked row,
 not exactly one; the extra record was not traced. The undo count is read from
 `v$transaction` before the `COMMIT`, inside the measured window, so the reads
 of that small query are part of both rows' figures. Through SQL the
-same change cost 29 reads and 588 bytes. The API's read-modify-write is
-the cost here, not the view. On the collection, the API writes about twice
-the redo of the SQL whole-document replace (54,120 against 27,444),
-although its lock costs little and its write is one statement. That
-difference is measured, not explained. An app that changes one
+same change cost 28 to 29 reads and 588 to 612 bytes. The API's read-modify-write is
+the cost here, not the view. On the collection, in three of the four runs, the API wrote about twice
+the redo of the SQL whole-document replace (54,116 to 54,436 against 27,444
+to 28,420), although its lock costs little and its write is one statement.
+In the first run it wrote 39,418, with the document update at 17.1 gets per
+call instead of about 43. Neither difference is explained. An app that changes one
 line of a large order will do better with SQL (`JSON_TRANSFORM` through the
 view, or a row update) than with a positional `$set`.
 
@@ -1241,7 +1250,8 @@ view, and reads the order documents again.
 - All 5 of customer 1's order documents have a new etag
   (`wr-s4d-etags-changed`); customer 2's 3 orders do not
   (`wr-s4d-other-etags-changed` = 0). The rename itself wrote one row
-  (768 bytes of redo, 39 reads, commit included).
+  (768 bytes of redo, commit included; 39 reads in three runs and 84 on the
+  freshly built database).
 - A write to order 1 with the etag read before the rename is refused with the
   etag mismatch error (`wr-s4d-stale-write-rejected` = 1), and changes
   nothing.
@@ -1279,15 +1289,15 @@ customer 1's MV rows show the new tier (checked: 21 of 21).
 
 | Arm | Order read: reads | Tier change + COMMIT: rows | reads | redo (bytes) |
 |---|---|---|---|---|
-| embedded | 3 | 100 documents | 1,000 to 1,001 | 157,444 to 159,608 |
+| embedded | 3 | 100 documents | 1,001 | 157,444 |
 | normalized (join) | 6 | 1 row | 5 to 6 | 600 to 624 |
-| materialized view | 3 | 1 row, then 100 view rows at COMMIT | 1,990 | 177,812 to 177,868 |
+| materialized view | 3 | 1 row, then 100 view rows at COMMIT | 1,974 to 1,989 | 177,828 to 177,892 |
 
 The materialized view reads like the embedded document (one index probe and
 one row) and stays correct after every `COMMIT`. But it moves the fan-out, it
 does not remove it. Per `COMMIT`, `v$sql` shows the refresh deleting customer
-1's 100 view rows (788.8 gets) and inserting 100 new ones
-(889.4 gets), plus the log row written and cleared. That costs more reads
+1's 100 view rows (788.8 to 789.6 gets) and inserting 100 new ones
+(873.6 to 890.4 gets), plus the log row written and cleared. That costs more reads
 and more redo than updating the 100 embedded copies directly. The database
 keeps the copy in sync, so the app cannot forget a copy, and the cost of the
 copy is still paid on every change. Only the normalized form pays for the
@@ -1297,7 +1307,8 @@ change once.
 most. A document is the cheapest thing to insert and the most expensive thing
 to change a little of. Rows are cheap to change and cost more to insert. A
 duality view changes exactly the rows that changed, but costs more reads than
-a plain row update to find them, and its inserts cost what row-by-row SQL
+a plain row update to find them, and its inserts cost about, and no less
+than, what row-by-row SQL
 costs. The MongoDB API's read-modify-write makes both targets pay for the
 whole document, and on a view it locks every child row. Etags make a rename
 visible to every client that holds a nesting document, without rewriting any
@@ -1369,8 +1380,9 @@ one more grant, in `docker/init/01-lab-user.sql`: `SELECT` on `V_$TRANSACTION`
 was added, apply it as shown under "Grants on a stack that is already running"
 in How to run.
 
-Cursor purges are checked, not assumed: `wr-purge-failures` counts the purges
-that failed in `70` (0 when all worked), and `wr-api-<target>-purge-left`
+Cursor purges are made visible: `wr-purge-failures` counts the purges in `70`
+that raised an error (0 when none did; it does not look for cursors left
+behind), and `wr-api-<target>-purge-left`
 counts the target's cursors still in `v$sql` after the purge in `71` (0 when
 it worked). Neither is an assertion: the counts are taken as growth over a
 window, so a cursor that survives a purge does not change them.
