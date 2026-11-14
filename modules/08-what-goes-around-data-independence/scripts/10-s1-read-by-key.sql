@@ -111,10 +111,16 @@ create or replace json relational duality view m08_ord_dv as
                'lines': [select json {'lineId': l.line_id, 'sku': l.sku, 'qty': l.qty} from m08_line l where l.order_id = o.id]}
     from m08_ord o;
 
+-- Statistics without histograms (SIZE 1), as in 12-s1-physical-join.sql. With
+-- the default (SIZE AUTO), a histogram on order_id appears or not depending on
+-- when the database last flushed its column-usage data, and with one the
+-- optimizer may read a 1,000-line order with a full scan when a cursor is
+-- parsed for that id (the CPU windows below parse each target fresh). The
+-- counted reads above run the indexed plan either way.
 BEGIN
-  dbms_stats.gather_table_stats(user, 'M08_ORD', cascade => true);
-  dbms_stats.gather_table_stats(user, 'M08_LINE', cascade => true);
-  dbms_stats.gather_table_stats(user, 'M08_ORD_DOC', cascade => true);
+  dbms_stats.gather_table_stats(user, 'M08_ORD', cascade => true, method_opt => 'FOR ALL COLUMNS SIZE 1');
+  dbms_stats.gather_table_stats(user, 'M08_LINE', cascade => true, method_opt => 'FOR ALL COLUMNS SIZE 1');
+  dbms_stats.gather_table_stats(user, 'M08_ORD_DOC', cascade => true, method_opt => 'FOR ALL COLUMNS SIZE 1');
 END;
 /
 
@@ -284,6 +290,106 @@ BEGIN
 END;
 /
 
+-- ===== Measurement: CPU, elapsed and bytes (v$sql, microseconds) =====
+-- m08_meter.measure_us, per reader and target: purge the reader's cursor, one
+-- warm-up run, 20 runs fetching every row, the growth of v$sql over the 20
+-- runs divided by 20 (CPU and elapsed in microseconds, buffer gets), and the
+-- bytes one run returns. Each reader has its own marker and binds the order
+-- id, so every target is parsed for its own id.
+DECLARE
+  TYPE t_num IS TABLE OF NUMBER;
+  TYPE t_str IS TABLE OF VARCHAR2(20);
+  ids t_num := t_num(900001, 900002, 900003, 900004, 900011, 900012, 900013, 900014);
+  ks  t_num := t_num(1, 10, 100, 1000, 1, 10, 100, 1000);
+  lay t_str := t_str('clustered', 'clustered', 'clustered', 'clustered',
+                     'interleaved', 'interleaved', 'interleaved', 'interleaved');
+  ok  NUMBER;
+BEGIN
+  FOR i IN 1 .. ids.COUNT LOOP
+    m08_meter.measure_us('s1-doc-' || lay(i) || '-k' || ks(i),
+      'select /*+ M08S1TDOC */ json_serialize(d.data returning blob) from m08_ord_doc d'
+      || ' where d.data."_id" = :id', 'M08S1TDOC', ids(i), 20, p_allow_lob => TRUE);
+    m08_meter.measure_us('s1-join-' || lay(i) || '-k' || ks(i),
+      'select /*+ M08S1TJOIN */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
+      || ' from m08_ord o join m08_line l on l.order_id = o.id where o.id = :id',
+      'M08S1TJOIN', ids(i), 20);
+    -- Sensitivity probe: the same document returned as OSON (binary JSON, as
+    -- a driver that reads the JSON type receives it) instead of serialized
+    -- to text. Its CPU shows how much of the doc reader's CPU is the text
+    -- serialization.
+    m08_meter.measure_us('s1-doc-oson-' || lay(i) || '-k' || ks(i),
+      'select /*+ M08S1TDOCO */ json_query(d.data, ''$'' returning blob format oson)'
+      || ' from m08_ord_doc d where d.data."_id" = :id', 'M08S1TDOCO', ids(i), 20, p_allow_lob => TRUE);
+    m08_meter.measure_us('s1-dv-' || lay(i) || '-k' || ks(i),
+      'select /*+ M08S1TDV */ json_serialize(d.data returning blob) from m08_ord_dv d'
+      || ' where d.data."_id" = :id', 'M08S1TDV', ids(i), 20, p_allow_lob => TRUE);
+    -- Each timed cursor, parsed for this target: an INDEX step and no full scan.
+    FOR m IN (SELECT column_value mk, column_value || '-' || lay(i) || '-k' || ks(i) nm
+                FROM TABLE(sys.odcivarchar2list('M08S1TDOC', 'M08S1TJOIN', 'M08S1TDV'))) LOOP
+      SELECT CASE WHEN EXISTS (SELECT 1 FROM v$sql s JOIN v$sql_plan p
+                                  ON p.sql_id = s.sql_id AND p.child_number = s.child_number
+                               WHERE s.sql_text LIKE '% ' || m.mk || ' */%' AND s.command_type = 3
+                                 AND p.operation = 'INDEX')
+                   AND NOT EXISTS (SELECT 1 FROM v$sql s JOIN v$sql_plan p
+                                      ON p.sql_id = s.sql_id AND p.child_number = s.child_number
+                                   WHERE s.sql_text LIKE '% ' || m.mk || ' */%' AND s.command_type = 3
+                                     AND p.operation = 'TABLE ACCESS' AND p.options LIKE '%FULL%')
+                  THEN 1 ELSE 0 END
+        INTO ok FROM dual;
+      m08_meter.record('tmp:s1-us-planok-' || m.nm, ok);
+    END LOOP;
+  END LOOP;
+END;
+/
+
+-- The record-at-a-time reader runs k + 1 statements per call, so its window
+-- covers both of its markers. Its bytes are the values it fetches, as text.
+DECLARE
+  TYPE t_num IS TABLE OF NUMBER;
+  TYPE t_str IS TABLE OF VARCHAR2(20);
+  TYPE t_key IS TABLE OF VARCHAR2(36);
+  ids  t_num := t_num(900001, 900002, 900003, 900004, 900011, 900012, 900013, 900014);
+  ks   t_num := t_num(1, 10, 100, 1000, 1, 10, 100, 1000);
+  lay  t_str := t_str('clustered', 'clustered', 'clustered', 'clustered',
+                      'interleaved', 'interleaved', 'interleaved', 'interleaved');
+  cust t_str;
+  stat t_str;
+  keys t_key;
+  sku  VARCHAR2(20);
+  qty  NUMBER;
+  b    NUMBER;
+  nm   VARCHAR2(80);
+  mk   CONSTANT VARCHAR2(30) := 'M08S1TN1P,M08S1TN1C';
+  PROCEDURE q(p_id NUMBER, p_k NUMBER) IS
+  BEGIN
+    b := 0;
+    SELECT /*+ M08S1TN1P */ o.customer, o.status, l.line_id
+      BULK COLLECT INTO cust, stat, keys
+      FROM m08_ord o JOIN m08_line l ON l.order_id = o.id
+     WHERE o.id = p_id;
+    IF keys.COUNT <> p_k THEN RAISE_APPLICATION_ERROR(-20814, 'n1 keys ' || keys.COUNT); END IF;
+    FOR j IN 1 .. keys.COUNT LOOP
+      SELECT /*+ M08S1TN1C */ l.sku, l.qty INTO sku, qty
+        FROM m08_line l WHERE l.line_id = keys(j);
+      b := b + lengthb(cust(j)) + lengthb(stat(j)) + lengthb(keys(j))
+             + lengthb(sku) + lengthb(to_char(qty));
+    END LOOP;
+  END q;
+BEGIN
+  FOR i IN 1 .. ids.COUNT LOOP
+    nm := 's1-n1-' || lay(i) || '-k' || ks(i);
+    m08_meter.record('tmp:' || nm || '-purge-left', m08_meter.vs_purge(mk));
+    q(ids(i), ks(i));                        -- warm-up
+    m08_meter.vs_begin(mk);
+    FOR r IN 1 .. 20 LOOP
+      q(ids(i), ks(i));
+    END LOOP;
+    m08_meter.vs_end(nm, mk, 20);
+    m08_meter.record(nm || '-bytes', b);
+  END LOOP;
+END;
+/
+
 -- All three readers return the same logical content: the order and all its lines.
 select 'ASSERT:s1-same-content:' ||
        case when (select count(*) from (
@@ -334,13 +440,14 @@ select 'METRIC:' || name || ':' || to_char(value, 'FM999999990')
 
 -- ===== Assertions (read back from m08_metrics) =====
 
--- The document read never costs more logical reads than the join.
+-- Directions are reported, not asserted. 1 when the document read does no
+-- more logical reads than the join, else 0.
 with ls as (select column_value l from table(sys.odcivarchar2list('clustered', 'interleaved'))),
      ks as (select column_value k from table(sys.odcinumberlist(1, 10, 100, 1000)))
-select 'ASSERT:s1-doc-le-join-' || l || '-k' || k || ':' ||
+select 'METRIC:s1-doc-le-join-' || l || '-k' || k || ':' ||
        case when (select value from m08_metrics where name = 's1-doc-' || l || '-k' || k || '-reads') <=
                  (select value from m08_metrics where name = 's1-join-' || l || '-k' || k || '-reads')
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from ls, ks
  order by l, k;
 
@@ -351,13 +458,14 @@ select 'ASSERT:s1-doc-body-read:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- The duality view is a join: it is never cheaper than the document.
+-- 1 when the duality view (a join) does at least the document's logical
+-- reads, else 0. Reported, not asserted.
 with ls as (select column_value l from table(sys.odcivarchar2list('clustered', 'interleaved'))),
      ks as (select column_value k from table(sys.odcinumberlist(1, 10, 100, 1000)))
-select 'ASSERT:s1-dv-ge-doc-' || l || '-k' || k || ':' ||
+select 'METRIC:s1-dv-ge-doc-' || l || '-k' || k || ':' ||
        case when (select value from m08_metrics where name = 's1-dv-' || l || '-k' || k || '-reads') >=
                  (select value from m08_metrics where name = 's1-doc-' || l || '-k' || k || '-reads')
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from ls, ks
  order by l, k;
 
@@ -378,6 +486,29 @@ select 'ASSERT:s1-n1-execs-k' || k || ':' ||
             then 'PASS' else 'FAIL' end
   from ks
  order by k;
+
+-- The v$sql windows (5 readers x 8 targets): every reader's cursor ran in every one of the 20 calls
+-- (the record-at-a-time reader k + 1 statements per call), and every purge
+-- left no cursor behind, so each window measured a freshly parsed cursor.
+select 'ASSERT:s1-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s1-%-execs-per-call'
+                     and value = case when name like 'tmp:s1-n1-%'
+                                      then to_number(regexp_substr(name, '-k([0-9]+)-', 1, 1, null, 1)) + 1
+                                      else 1 end) = 40
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1-us-plans-indexed:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s1-us-planok-%' and value = 1) = 24
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s1-%-purge-left') = 40
+             and (select count(*) from m08_metrics where name like 'tmp:s1-%-purge-left' and value <> 0) = 0
+            then 'PASS' else 'FAIL' end
+  from dual;
 
 -- Every measured statement used an index, and none scanned a whole table.
 select 'ASSERT:s1-plans-indexed:' ||

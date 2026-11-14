@@ -12,34 +12,42 @@ container and emits machine-checkable rows:
 
 ## What this module is for
 
-Article 08 makes one argument: Codd's data independence, the rule that an
-application should not break when the storage under it changes, can be restored
-for documents. A JSON Relational Duality View puts a declarative view between
-the document the app reads and writes and the tables that store it, so the
-storage can change while the app stays the same.
+Stonebraker and Pavlo, "What Goes Around Comes Around... And Around...",
+SIGMOD Record 53(2), 2024, predicted that relational and document systems
+would converge. This module measures one converged engine: Oracle AI Database
+26ai Free, in the lab container, where JSON collections, tables and duality
+views live in one database and share one transaction.
 
-The article is also a reply to Stonebraker and Pavlo, "What Goes Around Comes
-Around... And Around...", SIGMOD Record 53(2), 2024. They make several claims
-about document and key-value databases. Each scenario below answers one of
-those claims with something you can run, including the cases where documents
-lose. All of it runs on Oracle AI Database 26ai Free in the lab container.
+Four ideas run through the scenarios:
+
+- **A document is one stored shape the workload can pick.** The scenarios
+  measure what it saves and what it costs next to tables, in logical reads,
+  CPU time and bytes returned.
+- **A duality view is a compatibility layer.** It keeps an app that reads and
+  writes documents through a document API correct while the storage under it
+  moves to tables. A duality view is a join, and the scenarios measure what it
+  costs.
+- **New access patterns use SQL on the physical design that serves them**: a
+  covering index, a cluster, a lines table, a materialized view.
+- **Every result is reported as measured**, including where the document costs
+  more, and where CPU time and logical reads point in different directions.
 
 ## Scenario index
 
 Quotes are from Stonebraker and Pavlo 2024, section 2.
 
-| Scenario | Script(s) | The claim it answers | What it proves |
+| Scenario | Script(s) | Statement it tests | What it shows |
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
-| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does no more logical reads than the best indexed join, in both a clustered and an interleaved layout. The join's cost grows with the number of lines. The duality view is a join and costs at least as much as the document. (See S1 (A): a hash cluster beats the document up to 100 lines.) |
-| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the hostile objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster and a duality view over the IOT, with no direction asserted. **Result: the hash cluster beats the document for orders of up to 100 lines (2 reads against 3).** At 1,000 lines the document does the fewest reads. The other designs need about 2 to 2.3 times the document's reads up to 100 lines. |
-| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, when such a crossover exists. |
-| S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance. |
-| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant.** A crossover exists at every point. |
+| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time the order flips for small orders: the join uses less CPU than the serialized document at 1 and 10 lines in both layouts**, and slightly less at 100 lines clustered; the document uses less at 100 lines interleaved and at 1,000 lines. Most of the document's CPU above 10 lines is making JSON text. The duality view is a join and costs the most CPU. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3); in CPU the serialized document is not the cheapest reader at any size.** At 1,000 lines the document does the fewest reads (8), and with 20 large orders growing at once the fixed-size clusters fall far behind (64 and 118 reads). |
+| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 50 to 250; in CPU there is none at 10 and 100 lines (the normalized tables use less CPU for both queries), and at 1,000 lines it is below 10 and unstable.** |
+| S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance: **0.9 tier changes per 1,000 order reads in logical reads, and no crossover in CPU, where the join read uses less CPU than the embedded read.** |
+| Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: in logical reads each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant, and a crossover exists at every point. In CPU there is no crossover at any point of the S2 sweep or at 100 lines in the S1b sweep; at 1,000 lines it appears in one run of two.** |
 | S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
-| S3 at scale (B) | `60` to `69` | "there is no data independence", and the hostile objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
-| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the hostile objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about, and no less than, what row-by-row SQL costs (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. |
+| S3 at scale (B) | `60` to `69` | "there is no data independence", and the objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3 compared with stage 2). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
+| Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and no less in reads (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. In CPU (microseconds from `v$sql`), the one-line change through the duality view costs about 170 to 200 times the row update, though it writes the same redo. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
 ## How to run
@@ -55,9 +63,11 @@ python3 validator/run.py
 The validator runs every module in order, then every script in this module in
 file-name order. The scripts depend on that order: `00` builds the meter that
 later scripts use, and the S3 stages build on each other. A full validator run
-(all modules) takes about nine minutes. Most of it is S3 at scale (B): two
+(all modules) takes about eleven minutes. Most of it is S3 at scale (B): two
 API restarts (`02b` and `63`) and four stages of measured statements, where
-one aggregation alone takes 1.5 to 3.5 seconds per call for 21 calls.
+one aggregation alone takes 1.5 to 3.5 seconds per call for 21 calls. S1
+(A)'s 20 targets per size, each timed over 20 runs, take about two and a half
+minutes more.
 
 Numbers for the article come only from `validator/results.json`, under
 `"metrics"`.
@@ -150,6 +160,49 @@ else on the host, so they are noisy and only accurate to one centisecond. That
 is why the helper reports the median over 20 runs, with the max (and, for
 reads, the min), instead of a single run.
 
+**CPU in microseconds, from `v$sql`.** One centisecond is too coarse for a read
+that takes 20 microseconds, so the S1, S1 (A), S1b, S2, sweep (C) and writes (D)
+scripts also measure each statement the way S3 (B) does: the growth of
+`v$sql` (`CPU_TIME`, `ELAPSED_TIME`, `BUFFER_GETS`, in microseconds) for that
+statement's cursor over 20 runs, divided by 20.
+
+- `m08_meter.measure_us(p_name, p_sql, p_marker, p_bind, p_runs => 20,
+  p_allow_lob => FALSE)`:
+  - purges the statement's cursor and records how many are left
+    (`tmp:<p_name>-purge-left`, 0 when the purge worked);
+  - runs it once to warm up (parse and first run);
+  - snapshots `v$sql` for its `sql_id`, runs it 20 times fetching every row,
+    and snapshots again.
+  - It records `<p_name>-us` (CPU microseconds per run), `-ela-us` (elapsed
+    microseconds per run), `-gets` (buffer gets per run) and `-bytes`.
+  - `-bytes` is what one run returns, as text: the length of a serialized
+    document, or for a row set the sum over rows and columns of each value's
+    length as text (numbers through `to_char`).
+  - For checks it also records the executions per run and the plan hash.
+- `m08_meter.measure_dml_us(p_name, p_sql, p_marker, p_vals)` does the same for
+  one `UPDATE`. Each run is followed by a `COMMIT`. The `COMMIT` is not part
+  of the statement's figures; the statement's own undo and redo generation
+  is.
+- `m08_meter.vs_purge`, `vs_begin` and `vs_end` give the same window for a
+  group of statements found by their markers. The record-at-a-time reader and
+  the writes use them.
+- `m08_meter.measure_reads(p_name, p_sql, p_bind)` records the logical reads of
+  a query's second execution (S1 (A)'s 20-target readers use it).
+
+These figures are database-side only. They cover the statement's own parse,
+execute and fetch calls, including recursive SQL it runs (a duality view's
+internal statements). They leave out the client and the network. CPU per run
+moves from run to run by a few microseconds on small reads (with an occasional
+outlier), and by up to about 20% on large ones, so the tables below give
+ranges.
+
+A note on the document readers. They serialize the document to JSON text,
+which is what a client that asks for text receives. That serialization is CPU
+the join readers do not spend: they return values, not text. S1 and S2 also time the same
+document returned as OSON, the binary form a driver that reads the JSON type
+receives (`s1-doc-oson-*`, `s2-embedded-read-oson`), to show how much of the
+document's CPU is the serialization.
+
 Expected assertions:
 
 ```
@@ -159,10 +212,15 @@ ASSERT:m08-meter-repeat-ready:PASS
 ASSERT:m08-meter-lob-guard:PASS
 ASSERT:m08-meter-json-always-rejected:PASS
 ASSERT:m08-meter-lob-guard-null-safe:PASS
+ASSERT:m08-meter-us-ready:PASS
 ```
 
-The last two check the guard's edges: a bare JSON column is refused even with
-`p_allow_lob => TRUE`, and `p_allow_lob => NULL` counts as `FALSE`.
+`json-always-rejected` and `lob-guard-null-safe` check the guard's edges: a
+bare JSON column is refused even with `p_allow_lob => TRUE`, and
+`p_allow_lob => NULL` counts as `FALSE`. `us-ready` runs `measure_us` on a
+small table: CPU and elapsed are not negative, the query ran once per run,
+the purge left no cursor, and the bytes equal the result's text length
+computed in SQL.
 
 ## Proofs
 
@@ -232,11 +290,52 @@ Target orders have 1, 10, 100 and 1,000 lines, in two layouts:
 - **clustered:** each order's lines are inserted together. This shows what
   physical clustering buys.
 - **interleaved:** lines arrive round-robin across 200 orders that are open at
-  once, so each line lands in its own block: one block per line. This is a
+  once, so the lines of one order land about one block apart: about one block
+  per line. This is a
   constructed upper bound for a heap table with a single-column FK index.
 
 The document and duality-view readers serialize the document, so its bytes are
 really read; a client fetch costs the same.
+
+**CPU time and bytes.** Each reader is also timed with
+`m08_meter.measure_us` (see the harness): for every target, 20 runs, CPU and
+elapsed microseconds per read from `v$sql`, and the bytes one read returns.
+"doc as OSON" is a sensitivity probe: the same document returned as binary
+JSON (OSON, what a driver that reads the JSON type receives) instead of text.
+Logical reads are the second-execution reads; CPU is a range over the two
+Task 21 validator runs.
+
+| layout | k | doc: reads / CPU us | doc as OSON: CPU us | join: reads / CPU us | dv: reads / CPU us | n1: reads / CPU us | bytes, doc / join |
+|---|---|---|---|---|---|---|---|
+| clustered | 1 | 3 / 15 to 26 | 9 to 12 | 7 / 5 to 6 | 7 / 26 to 28 | 11 / 8 | 112 / 38 |
+| clustered | 10 | 3 / 14 to 15 | 10 | 7 / 8 | 7 / 41 to 43 | 47 / 28 to 29 | 544 / 380 |
+| clustered | 100 | 3 / 38 to 39 | 9 to 10 | 7 / 35 to 36 | 7 / 202 | 407 / 223 to 232 | 4,954 / 3,890 |
+| clustered | 1000 | 8 / 292 to 293 | 10 | 15 / 308 to 357 | 15 / 2,386 to 2,437 | 4,015 / 2,397 to 2,486 | 49,954 / 39,890 |
+| interleaved | 1 | 3 / 12 to 13 | 9 to 10 | 7 / 5 | 7 / 25 | 11 / 7 to 8 | 113 / 39 |
+| interleaved | 10 | 3 / 14 to 15 | 10 to 11 | 15 / 10 to 15 | 15 / 43 to 44 | 55 / 30 to 32 | 545 / 390 |
+| interleaved | 100 | 3 / 38 to 40 | 10 | 94 to 95 / 59 to 63 | 94 to 95 / 252 to 253 | 494 to 495 / 248 to 314 | 4,955 / 3,990 |
+| interleaved | 1000 | 8 / 292 | 10 | 894 / 639 to 671 | 894 / 2,834 to 2,876 | 4,894 / 2,727 to 2,744 | 49,955 / 40,890 |
+
+- **Logical reads: the document reads the fewest blocks.** 3 up to 100 lines
+  and 8 at 1,000, against 7 to 15 for the clustered join and about one block
+  per line for the interleaved join.
+- **CPU: for small orders the join uses less CPU than the serialized
+  document.** At 1 and 10 lines the join uses 5 to 15 microseconds
+  against the document's 12 to 26, in both layouts. At 100 lines
+  clustered the join uses slightly less (35 to 36 against 38 to 39). At 100
+  lines interleaved and at 1,000 lines the document uses less.
+- **Most of the document's CPU above 10 lines is making text.** Returned as
+  OSON, the same document takes 9 to 12 microseconds at every size up
+  to 100 lines. At 1,000 lines the document is stored out of the row, and the
+  probe returns a pointer to it without reading the body (3 buffer gets
+  against the serialized reader's 8), so there its figure leaves out the body
+  read and is only a lower bound.
+- **The duality view is a join that also builds the document on every
+  read.** It uses about twice the document's CPU at 1 line and about 8 to 10
+  times at 1,000 lines (2,386 to 2,876 microseconds).
+- **Bytes.** As text, the document is larger than the row set: it carries
+  every field name, while the row set repeats the order fields on every line.
+  112 against 38 bytes at one line, about 25% more at 100 and 1,000 lines.
 
 Expected assertions:
 
@@ -244,16 +343,37 @@ Expected assertions:
 ASSERT:s1-same-content:PASS
 ASSERT:s1-interleaved-spread:PASS
 ASSERT:s1-doc-body-read:PASS
-ASSERT:s1-doc-le-join-<layout>-k<k>:PASS     (8)
-ASSERT:s1-dv-ge-doc-<layout>-k<k>:PASS       (8)
 ASSERT:s1-join-grows-<layout>:PASS           (2)
 ASSERT:s1-n1-execs-k<k>:PASS                 (4)
+ASSERT:s1-us-measured:PASS
+ASSERT:s1-us-plans-indexed:PASS
+ASSERT:s1-us-purge-effective:PASS
 ASSERT:s1-plans-indexed:PASS
 ASSERT:s1-teardown-clean:PASS
 ```
 
-Metrics: `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`,
-`s1-n1-k{k}-execs`, `s1-meter-overhead-reads`, `s1-meter-overhead-execs`.
+- `doc-body-read` and `join-grows` are fairness checks: they show that the
+  document reader really reads the body and that the join really reads the
+  lines. They are not a comparison between designs.
+- `us-measured`: every timed cursor ran in every one of its 20 runs (the
+  record-at-a-time reader k + 1 statements per run).
+- `us-plans-indexed`: each timed cursor, parsed for its own target, has an
+  index step and no full scan.
+- `us-purge-effective`: every purge left no cursor, so every window measured
+  a freshly parsed cursor.
+- The directions are reported, not asserted. `s1-doc-le-join-<layout>-k<k>`
+  and `s1-dv-ge-doc-<layout>-k<k>` are METRIC rows: 1 when the document does
+  no more logical reads than the join (or the view at least as many as the
+  document), else 0.
+
+Metrics:
+
+- `s1-{doc|join|dv|n1}-{clustered|interleaved}-k{1|10|100|1000}-reads`;
+- the same readers with `-us`, `-ela-us`, `-gets` and `-bytes` (CPU and
+  elapsed microseconds per run, `v$sql` buffer gets per run, bytes returned),
+  and `s1-doc-oson-<layout>-k<k>-{us|ela-us|gets|bytes}`;
+- `s1-doc-le-join-<layout>-k<k>`, `s1-dv-ge-doc-<layout>-k<k>` (1 or 0);
+- `s1-n1-k{k}-execs`, `s1-meter-overhead-reads`, `s1-meter-overhead-execs`.
 
 Before its teardown, S1 copies its interleaved `doc` and `join` reads to
 `ref:s1-*` rows in the session table, so `12-s1-physical-join.sql` can check
@@ -265,10 +385,21 @@ A fair objection to S1: its join reads a heap table through a single-column
 `order_id` index, so in the interleaved layout every line is its own block.
 Oracle has physical designs that keep an order's lines together whatever order
 they arrive in. This script measures seven join designs, including
-the heap baseline and a duality view over the IOT. It builds its own data
+the heap baseline and a duality view over the IOT, plus three hash-cluster
+arms: the join in a hash cluster sized for each order size, a duality view
+over it, and the document itself in a hash cluster. It builds its own data
 (prefix `M08A_`) with S1's interleaved recipe and loads every line table in
 that same interleaved order, so any clustering comes from the physical design,
 not from the load order.
+
+**Twenty targets per order size.** One target per size can be a lucky or an
+unlucky one. The load holds 20 target orders at each size (1, 10, 100 and
+1,000 lines), each in its own slot of the round-robin, and every reader is
+measured on all 20. Target 1 at each size is S1's (the same ids and slots as
+before). The other 19 change the load in one way that matters: 20 orders of
+each size now grow at the same time, where before one order of each size grew
+among 196 small ones. The single-target metrics (`s1a-<reader>-k<k>-reads`)
+are still target 1's, on this load.
 
 | Reader | Storage | Plan, as measured |
 |---|---|---|
@@ -276,25 +407,49 @@ not from the load order.
 | heap | heap table, index on `order_id` | order by primary key, then an index range scan and one table block per line (S1's interleaved join) |
 | cov | heap table, covering index `(order_id, line_id, sku, qty)` | order by primary key, then an index range scan; the line table is never visited |
 | iot | index-organized table (IOT), primary key `(order_id, line_id)` | order by primary key, then a range scan of the IOT, whose rows live in the index sorted by order |
-| iotc | the same IOT with key compression (`COMPRESS 1`), moved online after the load so its leaf blocks are packed | as iot. It changes two things at once (compression and the post-load move), so its gain over iot at 1,000 lines (12 to 10 reads) cannot be credited to either one alone |
+| iotc | the same IOT with key compression (`COMPRESS 1`), moved online after the load so its leaf blocks are packed | as iot. It changes two things at once (compression and the post-load move), so its gain over iot at 1,000 lines cannot be credited to either one alone |
 | clu | index cluster on `order_id` holding the order and line tables | two index probes: the order row through its own primary key index, then the lines through the cluster index (`TABLE ACCESS CLUSTER`) |
 | hash | hash cluster on `order_id` holding the order and line tables | no index probe: both tables are reached by hashing the key (`TABLE ACCESS HASH` on each) |
 | dv | duality view over the iot tables | the iot join, built into a document (a join, measured as one) |
+| hashk | a hash cluster sized for the order size k, holding that size's 20 target orders | as hash (`TABLE ACCESS HASH` on each table, no index) |
+| hdv | duality view over the hashk tables | the hashk join, built into a document |
+| hdoc | the document in a single-table hash cluster keyed by order id, stored as OSON in a `RAW(2000)` column; 1 and 10 lines only | `TABLE ACCESS HASH`, no index; serialized like doc |
 
 Sizing. The index cluster is `SIZE 512`: a typical 10-line order is about 10
 line rows of roughly 40 bytes plus its header row, so about 500 bytes per key
 and about 15 orders per 8 KB block. The hash cluster is `SIZE 512 HASHKEYS
-22000`: the same bytes per key, and one hash key per order (the data has
-21,893 orders; Oracle rounds `HASHKEYS` up to a prime). In both clusters the
-1,000-line order chains extra blocks onto its key. Nothing else was tuned.
+22000`: the same bytes per key, and about one hash key per order (the data has
+19,860 orders, `s1a-orders`; Oracle rounds `HASHKEYS` up to a prime). In both
+clusters the 100-line and 1,000-line orders chain extra blocks onto their key.
+
+The fixed `SIZE 512` suits orders of about 10 lines, so the hash-cluster arms
+add one cluster per order size, sized for it (hashk, hdv): `SIZE` is the bytes
+of the k-line order (its order row and line rows, from `vsize` plus a few bytes
+of row overhead), plus 10%, rounded up to 256 bytes, at most one 8 KB block.
+That gives 256, 512, 3,584 and 8,192 bytes for 1, 10, 100 and 1,000 lines
+(`s1a-hashk-k<k>-size`). Each holds only the 20 target orders of its size,
+with `HASHKEYS 1000`, so targets rarely share a key: this is the hash design's
+best case at each size. (Loading the full data into the 100-line and
+1,000-line clusters took about two and a half minutes per run; the full-data
+case is the fixed `SIZE 512` cluster.)
+
+The document in a hash cluster (hdoc) is limited by what a clustered table can
+hold on this build: it takes neither a JSON column nor a LOB column. So the
+document is stored as OSON in a `RAW(2000)` column, checked `IS JSON FORMAT
+OSON`, the largest binary column a clustered table accepts here. A 10-line
+document is 442 bytes of OSON and fits; a 100-line document is 3,442 bytes
+(`s1a-doc-k<k>-oson-bytes`) and does not, so hdoc is measured at 1 and 10
+lines only, one cluster per size, sized and loaded like hashk. Nothing else
+was tuned.
 
 A hash cluster must be sized in advance. `HASHKEYS` and `SIZE` are fixed when
 the cluster is created, and here they were set knowing the final order count
-(21,893), which is the hash design's best case. If the orders grow past that,
+(19,860), which is the hash design's best case. If the orders grow past that,
 keys collide or chain extra blocks, and reads go up. The space is also taken up
 front: about 1,400 blocks here (22,000 keys of 512 bytes in 8 KB blocks),
-before the first order arrives. These are operational costs the read counts do
-not show.
+before the first order arrives. A cluster sized for 1,000-line orders takes a
+whole block per key. These are operational costs the read counts do not
+show.
 
 Statistics are gathered without histograms (`SIZE 1`). With the default
 (`SIZE AUTO`), a histogram on `order_id` appears or not depending on when the
@@ -306,48 +461,126 @@ favors the join side: it keeps the heap join on its cheaper plan.
 
 Every reader returns the same content: the order and all of its lines. Reads
 are counted on the second run with the meter overhead removed, as in S1. CPU
-and elapsed time come from `m08_meter.measure_repeat` (20 runs) for k = 100
-and k = 1,000 only, since smaller reads are below its one-centisecond
-resolution. On the lab container they are also below it at k = 1,000: the
-medians are 0 cs for every reader, so time does not separate them here.
+and elapsed time come from `m08_meter.measure_us` (20 runs per target,
+microseconds from `v$sql`). The older one-centisecond figures from
+`measure_repeat` (k = 100 and 1,000, target 1) are still recorded; at that
+resolution they do not separate the readers.
 
-**What it shows.** Logical reads, the same in all four validator runs (three
-back to back and one on a freshly built database; the article takes its
-numbers from `validator/results.json`):
+**What it shows.** Two validator runs (Task 21). Each cell is the median over
+the 20 targets (a range when the two runs differed), with the lowest and
+highest target over both runs in brackets. The last column is target 1 alone
+(the single-target metrics; for hashk, hdv and hdoc only CPU is recorded
+there).
 
-| k | doc | heap join | best of the other joins | best join vs doc |
+1 line per order:
+
+| reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
 |---|---|---|---|---|
-| 1 | 3 | 7 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
-| 10 | 3 | 15 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
-| 100 | 3 | 95 | hash cluster: 2 | the hash cluster wins (2 vs 3) |
-| 1000 | 8 | 894 | compressed IOT: 10 | the document wins (8 vs 10) |
+| doc | 3 (3) | 13 (12 to 16) | 113 | 3 / 14 |
+| heap | 7 (7) | 5 (5 to 6) | 39 | 7 / 5 |
+| cov | 6 (6) | 5 (4 to 6) | 39 | 6 / 5 |
+| iot | 6 (6) | 5 (5) | 39 | 6 / 5 |
+| iotc | 6 (6) | 5 (4 to 6) | 39 | 6 / 6 |
+| clu | 6 (6) | 5 (4 to 6) | 39 | 6 / 5 |
+| hash (SIZE 512) | 2 (2) | 4 (3 to 5) | 39 | 2 / 5 |
+| dv (over iot) | 6 (6) | 25 to 27 (24 to 30) | 195 | 6 / 25 to 27 |
+| hashk (sized for k) | 2 (2) | 3 to 4 (3 to 8) | 39 | - / 3 to 4 |
+| hdv (over hashk) | 2 (2) | 22 to 23 (21 to 32) | 195 | - / 22 to 23 |
+| hdoc | 1 (1) | 10 to 11 (10 to 13) | 113 | - / 11 |
 
-The physical designs measured here close most of the gap, and that is the
-honest headline. Against the heap join the document does about 100 times fewer
-reads at 1,000 lines. Against the other designs measured here the gap is
-about 2 to 2.3 times for orders of up to 100 lines (1.25 to 1.75 times at
-1,000 lines), and one design wins outright. The IOT, compressed IOT, index cluster, covering index and
-duality view need 6 or 7 reads up to 100 lines (the document needs 3) and 10
-to 14 at 1,000 lines (the document needs 8). **The hash cluster beats the
-document for orders of 1, 10 and 100 lines**: 2 reads against 3, because it
-reaches the order row and its lines by hashing the key, with no index at all.
-At 1,000 lines its chained blocks cost 14 reads, and the document wins. (The
-table shows the second-execution reads. The `measure_repeat` median for the
-hash cluster at 1,000 lines is 16; every other reader's median matches its
-second-execution figure within 1 read.) So
-of the seven join designs measured here, one beats the document for small and
-medium orders, and none beats it for the 1,000-line order. Every design that
-gets close stores the lines by order, chosen for this one access pattern,
-which is the same choice the document makes. Not tried here: a cluster where
-the order row is also read through the cluster key instead of its own primary
-key index, larger cluster `SIZE` values, partitioning by `order_id`, and
-caching layers (the result cache or the In-Memory column store). The script
-asserts no direction between the document and any join.
+10 lines per order:
+
+| reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
+|---|---|---|---|---|
+| doc | 3 (3) | 15 (14 to 19) | 546 | 3 / 14 to 17 |
+| heap | 15 (15) | 11 (10 to 12) | 400 | 15 / 10 to 11 |
+| cov | 6 (6 to 7) | 7 (7 to 8) | 400 | 6 / 7 |
+| iot | 6 (6 to 7) | 7 to 8 (7 to 9) | 400 | 6 / 7 |
+| iotc | 6 (6 to 7) | 7 to 8 (7 to 9) | 400 | 6 / 9 |
+| clu | 6 (6) | 7 (7 to 9) | 400 | 6 / 7 to 9 |
+| hash (SIZE 512) | 2 (2) | 6 (5 to 7) | 400 | 2 / 6 |
+| dv (over iot) | 6 (6 to 7) | 40 to 41 (39 to 46) | 628 | 6 / 40 |
+| hashk (sized for k) | 2 (2) | 5 to 6 (5 to 7) | 400 | - / 6 |
+| hdv (over hashk) | 2 (2) | 36 to 38 (36 to 43) | 628 | - / 36 to 41 |
+| hdoc | 1 (1) | 13 (13 to 17) | 546 | - / 13 |
+
+100 lines per order:
+
+| reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
+|---|---|---|---|---|
+| doc | 3 (3) | 39 (39 to 41) | 4,956 | 3 / 40 |
+| heap | 95 (95 to 96) | 64 to 66 (62 to 68) | 4,090 | 96 / 64 to 66 |
+| cov | 7 (6 to 7) | 29 to 30 (27 to 31) | 4,090 | 7 / 29 to 30 |
+| iot | 7 (6 to 8) | 29 (28 to 31) | 4,090 | 7 / 29 |
+| iotc | 6 (6 to 7) | 29 to 31 (28 to 34) | 4,090 | 6 / 29 to 34 |
+| clu | 6 (6) | 28 (27 to 29) | 4,090 | 6 / 28 |
+| hash (SIZE 512) | 2 (2 to 6) | 26 (25 to 28) | 4,090 | 2 / 25 to 26 |
+| dv (over iot) | 7 (6 to 8) | 202 (199 to 253) | 5,038 | 7 / 199 to 251 |
+| hashk (sized for k) | 2 (2) | 25 to 26 (24 to 27) | 4,090 | - / 25 |
+| hdv (over hashk) | 2 (2) | 192 to 200 (192 to 253) | 5,038 | - / 193 to 241 |
+
+1000 lines per order:
+
+| reader | reads: median (targets) | CPU us: median (targets) | bytes | target 1: reads / CPU us |
+|---|---|---|---|---|
+| doc | 8 (8) | 257 to 268 (253 to 322) | 49,956 | 8 / 256 to 257 |
+| heap | 899 (898 to 900) | 676 to 721 (621 to 785) | 41,890 | 898 / 721 to 785 |
+| cov | 16 (15 to 17) | 240 to 242 (204 to 292) | 41,890 | 14 / 229 to 241 |
+| iot | 14 (11 to 26) | 242 to 253 (217 to 292) | 41,890 | 24 / 241 to 290 |
+| iotc | 11 (11 to 12) | 242 to 254 (204 to 327) | 41,890 | 11 / 241 |
+| clu | 64 (54 to 71) | 292 to 304 (241 to 306) | 41,890 | 63 to 67 / 304 to 305 |
+| hash (SIZE 512) | 118 (108 to 126) | 291 (241 to 305) | 41,890 | 124 / 242 to 305 |
+| dv (over iot) | 13 (11 to 25) | 2,337 to 2,387 (2,287 to 2,536) | 50,038 | 24 / 2,337 to 2,386 |
+| hashk (sized for k) | 12 (12) | 204 to 205 (192 to 255) | 41,890 | - / 202 to 204 |
+| hdv (over hashk) | 10 (10) | 2,288 to 2,338 (2,237 to 2,383) | 50,038 | - / 2,289 to 2,339 |
+
+- **Logical reads.** Up to 100 lines the hash clusters read 2 blocks, the
+  document in a hash cluster 1, and the document 3. The covering index, the
+  IOTs, the index cluster and the duality views over them read 6 or 7, and the
+  heap join about one block per line. At 1,000 lines the document reads 8; the
+  next best are the duality view over the sized hash cluster (10), the
+  compressed IOT (11) and the sized hash cluster (12).
+- **Many large orders growing at once hurt the fixed-size clusters.** With 20
+  orders of 1,000 lines growing together, their overflow blocks interleave:
+  the index cluster reads 64 (median) blocks and the `SIZE 512` hash
+  cluster 118, against 11 and 14 on the earlier load with one
+  large order. The plain IOT varies by target (11 to 26), and so does the
+  duality view over it. The compressed IOT, moved after the load, does not.
+- **CPU: the serialized document is not the cheapest reader at any size.**
+  Up to 10 lines the co-located joins use 3 to 8 microseconds against the
+  document's 13 to 15, with the hash clusters lowest. At 100 lines they use 25
+  to 31 against 39. At 1,000 lines the covering index and both IOTs use about
+  240 to 255 against the document's 257 to 268, within about 10%, and the
+  sized hash cluster about 205; the index cluster and the fixed hash cluster
+  use a little more than the document (about 290 to 305). The duality views
+  use the most CPU at every size (about 2 times the document at 1 line and
+  about 9 times at 1,000 lines). The document as OSON, in S1, takes about 10
+  microseconds up to 100 lines, so the comparison depends on whether the
+  client asks for text.
+- **The document in a hash cluster** reads 1 block and uses 10 to 13
+  microseconds, a little less than the collection document (13 to 15), at the
+  sizes where it fits.
+- **Twenty targets against one.** Up to 100 lines, every reader's median
+  equals target 1 within a read or two. At 1,000 lines the medians differ
+  from target 1 for the IOT (14 against 24) and the duality view over it (13
+  against 24).
+
+Every design that gets close to the document stores the lines by order,
+chosen for this one access pattern, which is the same choice the document
+makes. Not tried here: a cluster where the order row is also read through
+the cluster key instead of its own primary key index, larger `SIZE` values
+for the fixed clusters, partitioning by `order_id`, and caching layers (the
+result cache or the In-Memory column store). The script asserts no direction
+between the document and any join.
 
 Expected assertions:
 
 ```
-ASSERT:s1a-same-content-k<k>:PASS            (4) all 8 readers, same rows
+ASSERT:s1a-same-content-k<k>:PASS            (4) all 8 readers, same rows, all 20 targets
+ASSERT:s1a-same-content-new-arms:PASS        hashk, hdv and hdoc return the document's rows for every target
+ASSERT:s1a-t20-plans:PASS                    every timed cursor (840) ran its access path, no full scan
+ASSERT:s1a-t20-measured:PASS                 every timed cursor ran once per run; 20 targets per reader and k
+ASSERT:s1a-t20-purge-effective:PASS          every purge left no cursor
 ASSERT:s1a-plan-clu:PASS                     TABLE ACCESS CLUSTER on the line table
 ASSERT:s1a-plan-cov:PASS                     covering index range scan, no TABLE ACCESS on the line table
 ASSERT:s1a-plan-dv:PASS                      INDEX RANGE SCAN on the IOT primary key
@@ -366,7 +599,10 @@ if a `.sh` script, after which the validator reconnects, runs between them).
 
 Metrics:
 
-- `s1a-{doc|heap|cov|iot|iotc|clu|hash|dv}-k{1|10|100|1000}-reads` (second-run reads);
+- `s1a-{doc|heap|cov|iot|iotc|clu|hash|dv}-k{1|10|100|1000}-reads` (second-run reads, target 1);
+- `s1a-{reader}-k{k}-{us|ela-us|bytes}` (target 1, from `measure_us`; every reader including hashk, hdv and hdoc);
+- `s1a-{reader}-k{k}-t20-{reads|us}-{median|min|max}`, `-t20-ela-us-median`, `-t20-bytes-median` and `-t20-targets` (over the 20 targets);
+- `s1a-hashk-k{k}-size`, `s1a-hdoc-k{1|10}-size`, `s1a-k{k}-order-bytes`, `s1a-doc-k{k}-oson-bytes`, `s1a-orders`;
 - `s1a-{reader}-k{100|1000}-{reads-median|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max|overhead-reads}`
   (from `measure_repeat`);
 - `s1a-{heap|clu|hash}-k{k}-blocks` (distinct blocks holding the target's lines);
@@ -419,22 +655,88 @@ one-block change in any term moves it. In order processing, item queries are
 usually low-frequency reports and KPIs. If a crossover does not exist at some
 size, `s1b-no-crossover-k<k>` is 1.
 
+**CPU time and bytes.** Every reader is timed again with
+`m08_meter.measure_us` (20 runs, microseconds from `v$sql`, its own marker,
+the same text and hints), and the crossover is computed a second time with
+CPU microseconds in place of logical reads
+(`s1b-crossover-item-queries-per-1000-order-reads-k<k>-us`, or
+`s1b-no-crossover-k<k>-us` = 1), each side again the cheaper of its two
+readers, this time in CPU. Logical reads are the counted second execution;
+CPU is a range over the two Task 21 validator runs.
+
+| k | reader | reads | CPU us | bytes |
+|---|---|---|---|---|
+| 10 | childtable-plain | 22 | 12 | 200 |
+| 10 | childtable-covered | 2 | 5 | 200 |
+| 10 | orderdocs-jsontable | 22 | 97 | 200 |
+| 10 | orderdocs-serialized | 22 | 93 to 96 | 10,771 |
+| 10 | itemdv | 2 | 5 | 200 |
+| 10 | doc | 3 | 15 to 16 | 538 |
+| 10 | join | 6 | 8 | 374 |
+| 100 | childtable-plain | 23 | 13 | 220 |
+| 100 | childtable-covered | 2 | 5 | 220 |
+| 100 | orderdocs-jsontable | 22 | 641 | 220 |
+| 100 | orderdocs-serialized | 22 | 542 to 590 | 98,971 |
+| 100 | itemdv | 2 | 4 to 5 | 220 |
+| 100 | doc | 3 | 39 | 4,948 |
+| 100 | join | 8 | 35 to 36 | 3,884 |
+| 1000 | childtable-plain | 22 | 12 to 13 | 240 |
+| 1000 | childtable-covered | 2 | 5 | 240 |
+| 1000 | orderdocs-jsontable | 222 | 5,786 to 5,889 | 240 |
+| 1000 | orderdocs-serialized | 122 | 5,387 to 5,488 | 998,971 |
+| 1000 | itemdv | 2 | 5 to 6 | 240 |
+| 1000 | doc | 8 | 305 to 306 | 49,948 |
+| 1000 | join | 14 to 15 | 306 | 39,884 |
+
+| k | crossover, logical reads | crossover, CPU us |
+|---|---|---|
+| 10 | 150 | none |
+| 100 | 250 | none |
+| 1000 | 50 to 58 | 0.19 in 1 run, none in 1 |
+
+- **The item query costs the documents far more CPU than reads suggest.**
+  The child table answers in about 5 microseconds at every size. The order
+  documents take about 100 microseconds at 10 lines, about 590 at 100 and
+  about 5,500 at 1,000: every matching order is read and serialized (or
+  scanned by `JSON_TABLE`) whole, and the serialized reader returns 10,771 to
+  998,971 bytes to deliver 20 pairs (200 to 240 bytes from the child table).
+- **The order read by key does not favor the document in CPU.** At 10 lines
+  the join uses 8 microseconds against the document's 15 to 16, at 100 lines
+  35 to 36 against 39, and at 1,000 lines the two are equal within a
+  microsecond (305 to 306).
+- **So in CPU there is no crossover at 10 and 100 lines: the normalized
+  tables use less CPU for both queries.** At 1,000 lines a crossover in CPU
+  appears in one run (0.19 item queries per 1,000 order reads) and not in the
+  other, because its numerator is a difference of a microsecond or two
+  between two reads of about 305.
+
 Expected assertions:
 
 ```
-ASSERT:s1b-outofrow-penalty-k1000:PASS
-ASSERT:s1b-itemdv-close-to-childtable-k<k>:PASS  (3)
-ASSERT:s1b-gap-grows-with-k:PASS
-ASSERT:s1b-penalty-ratio-grows:PASS
-ASSERT:s1b-crossover-k<k>-positive:PASS          (each k where documents cost more per item query)
 ASSERT:s1b-same-content:PASS
 ASSERT:s1b-plans-indexed:PASS
+ASSERT:s1b-us-measured:PASS
+ASSERT:s1b-us-purge-effective:PASS
+ASSERT:s1b-us-plans-indexed:PASS
 ASSERT:s1b-teardown-clean:PASS
 ```
 
+Directions are reported, not asserted. These are METRIC rows, 1 or 0:
+`s1b-outofrow-penalty-k1000` (the order documents read more than twice the
+child table), `s1b-itemdv-close-to-childtable-k<k>` (the item view reads at
+most twice the child table), `s1b-gap-grows-with-k` and
+`s1b-penalty-ratio-grows` (the documents' read ratio over the child table is
+larger at k = 1,000 than at k = 10 or 100), and `s1b-crossover-k<k>-positive`
+(at a k where the documents read more per item query, the crossover is above
+zero).
+
 Metrics: `s1b-{childtable|childtable-plain|childtable-covered|orderdocs|orderdocs-jsontable|orderdocs-serialized|itemdv|doc|join}-k{10|100|1000}-reads`,
+the same names with `-us` (CPU microseconds per run; for `childtable` and
+`orderdocs` the cheaper of the two readers) and, for each measured reader,
+`-ela-us`, `-gets` and `-bytes`;
 `s1b-doc-bytes-k{k}`, `s1b-crossover-item-queries-per-1000-order-reads-k{k}` (or
-`s1b-no-crossover-k{k}`), `s1b-meter-overhead-reads`.
+`s1b-no-crossover-k{k}`) and the same with `-us` for the CPU crossover;
+the METRIC directions listed above; `s1b-meter-overhead-reads`.
 
 ### S2: duplicated data and what it costs to keep it in sync (`scripts/30-s2-write-amplification.sql`)
 
@@ -519,18 +821,50 @@ pattern: copy the fields that never or rarely change (a name), and keep the
 volatile ones (a tier) behind a reference. Redo is a separate cost axis, and it makes the write side worse still for
 embedding. If no crossover exists, `s2-no-crossover` is 1.
 
+**CPU time.** The reads are timed with `m08_meter.measure_us` and the two
+updates with `m08_meter.measure_dml_us` (20 runs each, microseconds from
+`v$sql`; each update run alternates SILVER and GOLD and is committed after the
+statement, and the update's CPU includes its undo and redo generation). The
+crossover is computed again with CPU microseconds in place of logical reads,
+`s2-crossover-updates-per-1000-reads-us` (or `s2-no-crossover-us` = 1). Logical
+reads are the counted second execution; CPU is a range over the two Task 21
+validator runs.
+
+| statement | reads | CPU us | bytes |
+|---|---|---|---|
+| embedded-read | 3 | 15 to 19 | 97 |
+| embedded-read-oson | - | 12 | 134 |
+| normalized-read-pk | 6 | 5 | 25 |
+| normalized-read-covered | 4 | 4 to 5 | 25 |
+| embedded-update | 1,094 to 1,096 | 2,842 to 2,897 | - |
+| normalized-update | 7 | 14 to 16 | - |
+| crossover (tier changes per 1,000 order reads) | 0.90 | none | |
+
+- **In CPU the embedded read costs more than the join.** The embedded order
+  takes 15 to 19 microseconds and the normalized join 4 to 5. The embedded
+  read saves an index probe in logical reads, but returning a document costs
+  more CPU than returning a row. Returned as OSON instead of text
+  (`s2-embedded-read-oson`), it still takes 12.
+- **So in CPU there is no crossover** (`s2-no-crossover-us` = 1 in both runs):
+  the normalized form uses less CPU for the read and for the tier change (14
+  to 16 microseconds against about 2,850 to 2,900 for 100 documents). Measured
+  in logical reads, the crossover is 0.9 tier changes per 1,000 order reads.
+
 Expected assertions:
 
 ```
 ASSERT:s2-embedded-touches-N:PASS
 ASSERT:s2-normalized-touches-1:PASS
-ASSERT:s2-embedded-redo-gt-normalized:PASS
-ASSERT:s2-embedded-read-cheaper:PASS
-ASSERT:s2-crossover-positive:PASS
 ASSERT:s2-same-content:PASS
 ASSERT:s2-plans-indexed:PASS
+ASSERT:s2-us-measured:PASS
+ASSERT:s2-us-purge-effective:PASS
 ASSERT:s2-teardown-clean:PASS
 ```
+
+Directions are reported, not asserted: `s2-embedded-redo-gt-normalized`,
+`s2-embedded-read-cheaper` and `s2-crossover-positive` are METRIC rows, 1 or
+0 (in logical reads and redo).
 
 `s2-same-content` checks two things, before and after the tier change:
 
@@ -543,7 +877,11 @@ Metrics:
 - `s2-{embedded|normalized}-update-{reads|redo}`;
 - `s2-embedded-read-reads`, `s2-normalized-read-{pk|covered}-reads`, and
   `s2-normalized-read-reads` (the cheaper of the two);
-- `s2-crossover-updates-per-1000-reads` (or `s2-no-crossover`);
+- `s2-crossover-updates-per-1000-reads` (or `s2-no-crossover`), and the same
+  with `-us` for the CPU crossover;
+- `s2-{embedded-read|embedded-read-oson|normalized-read-pk|normalized-read-covered|embedded-update|normalized-update}-{us|ela-us|gets}`,
+  `-bytes` for the reads, and `s2-normalized-read-us` (the cheaper of the two);
+- the METRIC directions listed above;
 - `s2-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`;
 - `s2-meter-overhead-{reads|redo}`.
 
@@ -615,10 +953,11 @@ its numbers from `validator/results.json`.
 | 1000 | 500 | 5 | 2649 | 8 | 14 to 15 | 2.27 to 2.65 |
 
 The k = 1,000 join read was 14 in six validator runs and 15 in two (one of
-them the first run on a freshly built database). One read
+them the first run on a freshly built database); in the two Task 21 runs it
+was 14 both times. One read
 in the numerator moves every k = 1,000 crossover by about 15% (200 to 233 at
 M = 5, 2.27 to 2.65 at M = 500), as S1b warned. The k = 100 figures were the
-same in all eight runs.
+same in all ten runs.
 
 **How strongly it depends on M: about in inverse proportion.** The child table
 answers from the covering index in 2 to 5 reads whatever M is. The order
@@ -674,6 +1013,50 @@ times more orders can change its tier ten times less often before embedding
 stops paying. S2's number holds only at N = 100. What does not change is the
 direction: a crossover exists at every N.
 
+**The crossovers in CPU time.** Every point is timed again with
+`m08_meter.measure_us` (reads) and `m08_meter.measure_dml_us` (updates): 20
+runs, microseconds from `v$sql`, each timed cursor checked to run the same plan
+as its counted cursor (`s1c-us-same-plan`, `s2c-us-same-plan`). The crossovers
+are computed again with CPU microseconds in place of logical reads
+(`...-crossover-...-us`, or `...-no-crossover-us` = 1). Ranges over the two
+Task 21 validator runs; "none" means no crossover in that run.
+
+| k | M | childtable CPU us | orderdocs CPU us | doc CPU us | join CPU us | crossover, reads | crossover, CPU |
+|---|---|---|---|---|---|---|---|
+| 100 | 5 | 3 to 4 | 141 to 142 | 38 to 41 | 36 to 37 | 600 | none |
+| 100 | 20 | 5 | 541 to 591 | 38 to 41 | 36 to 37 | 150 | none |
+| 100 | 100 | 13 | 2,833 to 2,889 | 38 to 41 | 36 to 37 | 30 | none |
+| 100 | 500 | 51 to 52 | 13,933 to 14,527 | 38 to 41 | 36 to 37 | 6.01 | none |
+| 1000 | 5 | 4 | 1,337 to 1,339 | 255 to 305 | 305 to 355 | 200 | 74.91 in 1 run, none in 1 |
+| 1000 | 20 | 5 to 6 | 5,338 to 5,487 | 255 to 305 | 305 to 355 | 50 | 18.75 in 1 run, none in 1 |
+| 1000 | 100 | 13 to 14 | 27,901 to 28,304 | 255 to 305 | 305 to 355 | 10 | 3.53 in 1 run, none in 1 |
+| 1000 | 500 | 51 to 53 | 139,874 to 141,324 | 255 to 305 | 305 to 355 | 2.27 | 0.71 in 1 run, none in 1 |
+
+| N | embedded read CPU us | normalized read CPU us | embedded update CPU us | normalized update CPU us | crossover, reads | crossover, CPU |
+|---|---|---|---|---|---|---|
+| 10 | 12 to 13 | 5 | 348 to 392 | 21 | 8.40 | none |
+| 100 | 12 to 13 | 5 | 2,791 to 2,976 | 21 to 23 | 0.92 | none |
+| 1000 | 13 | 4 to 5 | 29,950 to 30,298 | 23 to 25 | 0.10 | none |
+
+- **S1b sweep.** In CPU the order documents pay about 28 microseconds per
+  matching order at 100 lines and about 280 at 1,000 lines, against 4 to 52
+  for the child table. But the order read by key does not favor the document:
+  at 100 lines the join uses 36 to 37 microseconds against the document's 38
+  to 41, and at 1,000 lines the two are within the run-to-run noise. So at
+  100 lines there is no crossover in CPU at any M (the normalized tables use
+  less CPU for both queries), and at 1,000 lines a crossover appears in one
+  run and not in the other.
+- **S2 sweep.** In CPU the embedded read costs more than the join at every N
+  (12 to 13 microseconds against 4 to 5), so there is no crossover in CPU at
+  any N: the normalized form uses less CPU for both the read and the tier
+  change. The embedded update's CPU grows with N (about 350 to 390, 2,800 to
+  3,000 and 30,000 microseconds at N = 10, 100 and 1,000); the normalized
+  update stays at 21 to 25.
+- **What changes and what does not.** In logical reads each crossover falls
+  about in inverse proportion to its parameter and exists at every point. In
+  CPU, the document's read advantage disappears, so the crossovers disappear
+  or become too small and unstable to quote.
+
 **Time.** CPU and elapsed medians come from 20 timed runs. For the S1b sweep
 they are from `m08_meter.measure_repeat` for the item readers at M = 100 and
 500; for the S2 sweep, from a loop of 20 embedded updates at N = 100 and 1,000,
@@ -696,6 +1079,9 @@ ASSERT:s1c-plans-indexed:PASS                no full table scan; the order-docum
 ASSERT:s1c-childtable-covered:PASS           the child-table reader uses the covering index with no line-table visit at every M
 ASSERT:s1c-timed-same-plan:PASS              each measure_repeat copy ran the counted cursor's plan
 ASSERT:s1c-crossover-recorded:PASS           a positive crossover or s1c-k<k>-m<M>-no-crossover at every point
+ASSERT:s1c-us-measured:PASS                  every timed cursor ran once per run
+ASSERT:s1c-us-purge-effective:PASS           every purge left no cursor
+ASSERT:s1c-us-same-plan:PASS                 each timed cursor ran the counted cursor's plan
 ASSERT:s1c-teardown-clean:PASS
 ASSERT:s2c-embedded-touches-N-n<N>:PASS      (3) docs touched = N, normalized rows touched = 1
 ASSERT:s2c-same-content-n<N>:PASS            (3) same fields before and after, every copy carries the new tier
@@ -703,6 +1089,9 @@ ASSERT:s2c-plans-captured:PASS               every measured statement has an ALL
 ASSERT:s2c-reads-indexed:PASS                no full table scan on the reads; the covering read visits no table
 ASSERT:s2c-timed-same-plan:PASS              each timed update ran the counted cursor's plan
 ASSERT:s2c-crossover-recorded:PASS           a positive crossover or s2c-n<N>-no-crossover at every N
+ASSERT:s2c-us-measured:PASS                  every timed cursor ran once per run
+ASSERT:s2c-us-purge-effective:PASS           every purge left no cursor
+ASSERT:s2c-us-same-plan:PASS                 each timed cursor ran the counted cursor's plan
 ASSERT:s2c-teardown-clean:PASS
 ```
 
@@ -718,13 +1107,15 @@ Metrics:
 - `s2c-n{N}-embedded-read-reads`, `s2c-n{N}-normalized-read-{pk|covered}-reads`, `s2c-n{N}-normalized-read-reads`;
 - `s2c-n{N}-crossover-updates-per-1000-reads` (or `s2c-n{N}-no-crossover`);
 - `s2c-n{100|1000}-embedded-update-{timed-reads-median|cpu-cs-median|cpu-cs-max|elapsed-cs-median|elapsed-cs-max}`;
-- `s2c-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`, `s1c-meter-overhead-reads`, `s2c-meter-overhead-{reads|redo}`.
+- `s2c-idx-{cust-pk|cust-cov|ord-pk|ord-cov|doc-pk|doc-cust}-blevel`, `s1c-meter-overhead-reads`, `s2c-meter-overhead-{reads|redo}`;
+- from `measure_us` / `measure_dml_us`: `s1c-k{k}-m{M}-{reader}-{us|ela-us|gets|bytes}`, `s1c-k{k}-{doc|join}-{us|ela-us|gets}` (and `s1c-k{k}-join-bytes`), `s1c-k{k}-m{M}-orderdocs-us`; `s2c-n{N}-{statement}-{us|ela-us|gets}`, `-bytes` for the reads, `s2c-n{N}-normalized-read-us`;
+- the CPU crossovers `s1c-k{k}-m{M}-crossover-item-queries-per-1000-order-reads-us` (or `s1c-k{k}-m{M}-no-crossover-us`) and `s2c-n{N}-crossover-updates-per-1000-reads-us` (or `s2c-n{N}-no-crossover-us`).
 
 ### S4: one canonical form, two documents (`scripts/40-s4-two-projections.sql`)
 
 Stonebraker and Pavlo make two claims about document databases (section 2.3,
 p.23): "if the join is not one-to-many, then there will be duplicated data", and
-"there is no data independence". S4 answers both with one setup. It is a
+"there is no data independence". S4 tests both with one setup. It is a
 correctness check, not a measurement.
 
 The canonical form is three normalized tables: customers, orders, and order
@@ -1102,7 +1493,7 @@ Metrics: `s3b-<statement>-stage<N>-gets`, `-cpu-us` and `-ela-us` (per call;
 CPU and elapsed in microseconds) for the six statements and four stages; the
 same for the controls as `s3b-ctl-<control>-stage<N>-...`; and
 `s3b-stage<N>-hist-<index>` (1 if the index's column has a histogram).
-Large read counts repeat within about 1% from run to run. Small counts can
+Large read counts repeat within about 1 to 2% from run to run. Small counts can
 move by a few reads, mostly on a freshly built database (`byid` at stage 3: 9
 in three runs, 11 on the fresh one). CPU and elapsed time are noisy on this
 shared container, so read them as sizes, not exact values.
@@ -1134,14 +1525,15 @@ measured `COMMIT` carries another write. The meter's own overhead is removed
 from reads and redo. Session statistics include recursive SQL, so the duality
 view's own statements and the materialized view's refresh are counted; those
 statements are also listed from `v$sql` (executions, rows and buffer gets per
-call, with their text) as `wr-vs-*` metrics and `PLAN` rows. CPU is at or
-below 1 centisecond for nearly every write here, so it does not separate them;
-reads and redo do. The executed plan of every measured statement is printed as
-`PLAN` rows. The figures are ranges over four validator runs, three back to
-back and one on a freshly built database: a range ("21 to 24") means the runs differed, a single figure
-means all four agreed. Large read counts repeat within about 1%; small counts
-can move by a few reads, mostly on the freshly built database; redo moves by
-1 to 2%.
+call, with their text) as `wr-vs-*` metrics and `PLAN` rows. The session CPU
+statistic is at or below 1 centisecond for nearly every write here, so CPU is
+also taken in microseconds from `v$sql` (table 6 below). The executed plan of
+every measured statement is printed as `PLAN` rows. The reads and redo figures
+in tables 1 to 5 are ranges over four validator runs, three back to back and
+one on a freshly built database: a range ("21 to 24") means the runs
+differed, a single figure means all four agreed. Large read counts repeat within about 1%; redo moves
+by up to about 4% on the small figures; small read counts move by a few in
+any run.
 
 **The indexes are not the same on both sides.** The collection has one index,
 on `_id`. The orders and lines tables have a primary key each and an index on
@@ -1163,9 +1555,9 @@ so every insert lands at the right edge of the indexes.
 
 The document insert is one row and one index entry, so it is the cheapest.
 The array insert keeps the plain SQL lines to about 100 bytes of redo each.
-The duality view costs about, and no less than, what the row-by-row SQL
-insert costs: about 28% more reads (919 to 923 against 717 to 719) and about
-the same redo at k = 100. Yet `v$sql` shows the
+The duality view costs about what the row-by-row SQL insert costs, and no less
+in reads: about 28% more reads (919 to 923 against 717 to 719) and about the
+same redo at k = 100 (within about 1%, lower in some runs and higher in others). Yet `v$sql` shows the
 view sending its lines as one statement per document
 (`wr-vs-ins-dv-k100-insert-line-execs-per-call` = 1, rows per call
 100, 725 to 739 gets per call). That statement
@@ -1303,13 +1695,65 @@ keeps the copy in sync, so the app cannot forget a copy, and the cost of the
 copy is still paid on every change. Only the normalized form pays for the
 change once.
 
+**6. CPU per write.** The growth of `v$sql` over the 20 counted runs, for the
+write's own statements, divided by 20 (`wr-<write>-us`). The window opens after
+the warm-up run, so no parse is counted. A write through a duality view or
+with an MV log runs its internal statements inside the write, and they are
+part of its figure; the `v$sql` buffer gets of the view writes match their
+session logical reads (`wr-ins-dv-k100-gets` 932 to 936 against 918 to 919 reads), so
+the figure includes them. The `COMMIT` is not a statement, so it is not in
+these figures, but each statement's undo and redo generation is. The
+materialized view's refresh runs inside the `COMMIT`; its statements are
+listed separately (`wr-vs-mv-refresh-<statement>-us-per-call`) and added to
+the update in `wr-mv-upd-mv-total-us`. Reads and redo here are from the same
+two Task 21 validator runs as the CPU.
+
+| write | k | reads | redo (bytes) | CPU us |
+|---|---|---|---|---|
+| insert, collection | 10 | 5 to 6 | 1,332 to 1,380 | 48 to 71 |
+| insert, collection | 100 | 7 to 8 | 3,908 | 65 to 94 |
+| insert, duality view | 10 | 97 to 98 | 7,988 to 8,756 | 154 to 158 |
+| insert, duality view | 100 | 918 to 919 | 77,944 to 78,052 | 724 to 803 |
+| insert, plain SQL array | 10 | 14 to 15 | 2,572 to 2,692 | 47 to 59 |
+| insert, plain SQL array | 100 | 20 to 21 | 10,888 to 11,016 | 157 to 171 |
+| insert, plain SQL row by row | 10 | 75 to 76 | 7,988 to 8,796 | 87 to 100 |
+| insert, plain SQL row by row | 100 | 715 to 718 | 77,800 to 77,976 | 760 to 777 |
+| knob 3, collection, by lineId | | 31 | 27,592 | 1,009 to 1,060 |
+| knob 3, collection, by position | | 31 | 27,592 | 718 to 746 |
+| knob 3, collection, whole document | | 21 | 27,444 to 27,488 | 201 to 266 |
+| knob 3, duality view | | 29 to 31 | 588 | 2,989 to 3,017 |
+| knob 3, lines table | | 6 | 588 | 15 to 18 |
+| SELECT FOR UPDATE, collection | | 8 | 548 | 27 |
+| SELECT FOR UPDATE, duality view | | 1,038 to 1,039 | 223,544 | 6,226 to 6,419 |
+| tier change, embedded | | 1,001 | 157,444 | 2,918 to 2,954 |
+| tier change, normalized | | 6 | 600 | 14 to 15 |
+| tier change, materialized view (update only) | | 1,981 to 1,997 | 177,672 to 177,828 | 93 to 97 |
+| tier change, materialized view, with its refresh at COMMIT | | | | 6,776 to 6,835 |
+
+- **Inserts.** The document insert uses the least CPU (65 to 94
+  microseconds at 100 lines). The array insert of the plain SQL rows uses
+  about 2 times that; the duality view and the row-by-row SQL insert use about
+  8 to 12 times, about the same as each other.
+- **Knob 3, one line in a 1,000-line order.** The row update uses 15 to 18
+  microseconds. The collection's `JSON_TRANSFORM` uses about 720 to 1,060,
+  and replacing the whole prepared document about 200 to 270. Through the
+  duality view the same change uses about 3,000 microseconds, about 170 to 200
+  times the row update, although it writes exactly the row update's redo:
+  the view rebuilds the 1,000-line document to find the line.
+- **`SELECT ... FOR UPDATE`** of the order takes about 27 microseconds on the
+  collection and about 6,200 to 6,400 on the view, which locks 1,001 rows.
+- **The materialized view.** The tier change itself uses about 95
+  microseconds, and its refresh at `COMMIT` about 6,700 more (deleting and
+  inserting customer 1's 100 view rows): about 6,800 in all, about twice the
+  CPU of updating the 100 embedded copies directly (about 2,900) and about 450
+  times the normalized update (14 to 15).
+
 **What it shows.** Writes are where the shape of the stored data shows up
 most. A document is the cheapest thing to insert and the most expensive thing
 to change a little of. Rows are cheap to change and cost more to insert. A
 duality view changes exactly the rows that changed, but costs more reads than
-a plain row update to find them, and its inserts cost about, and no less
-than, what row-by-row SQL
-costs. The MongoDB API's read-modify-write makes both targets pay for the
+a plain row update to find them, and its inserts cost about what row-by-row
+SQL costs (no less in reads). The MongoDB API's read-modify-write makes both targets pay for the
 whole document, and on a view it locks every child row. Etags make a rename
 visible to every client that holds a nesting document, without rewriting any
 of them. A materialized view keeps a copy in sync for you, at about the price
@@ -1325,6 +1769,8 @@ ASSERT:wr-s4d-etag-controls:PASS
 ASSERT:wr-mv-reflects-commit:PASS
 ASSERT:wr-mv-refresh-fast:PASS
 ASSERT:wr-plans-captured:PASS
+ASSERT:wr-us-measured:PASS
+ASSERT:wr-us-purge-effective:PASS
 ASSERT:wr-teardown-clean:PASS
 ASSERT:wr-api-one-doc-per-call:PASS
 ASSERT:wr-api-change-visible:PASS
@@ -1368,7 +1814,10 @@ from the meter's `measure_repeat`; `wr-k3-doc-*` (text, OSON and in-row
 bytes); `wr-s4d-*`; `wr-mv-fast-on-commit`, `wr-mv-refresh-method`,
 `wr-mv-last-refresh-type`, `wr-mv-staleness`;
 `wr-vs-<window>-<statement class>-execs-per-call`, `-rows-per-call` and
-`-gets-per-call` for the recursive statements; and from `71`,
+`-gets-per-call` for the recursive statements (over the window's 21 calls),
+and `-us-per-call` and `-ela-us-per-call` (over the 20 calls after the
+warm-up); `wr-<write>-us`, `-ela-us` and `-gets` (`v$sql`, per counted run)
+for every write in tables 1 to 5, and `wr-mv-upd-mv-total-us`; and from `71`,
 `wr-api-<target>-statements`, `wr-api-<target>-<statement class>-execs-per-call`
 and `-gets-per-call`, `-vsql-gets-per-call`, `-vsql-cpu-us-per-call`,
 `-same-session`, `-session-reads-per-call`, `-session-redo-per-call` and
@@ -1382,10 +1831,11 @@ in How to run.
 
 Cursor purges are made visible: `wr-purge-failures` counts the purges in `70`
 that raised an error (0 when none did; it does not look for cursors left
-behind), and `wr-api-<target>-purge-left`
-counts the target's cursors still in `v$sql` after the purge in `71` (0 when
-it worked). Neither is an assertion: the counts are taken as growth over a
-window, so a cursor that survives a purge does not change them.
+behind), and `wr-api-<target>-purge-left` counts the target's cursors still in
+`v$sql` after the purge in `71` (0 when it worked). Neither is an assertion:
+the counts are taken as growth over a window, so a cursor that survives a
+purge does not change them. The marked write cursors are purged once before
+the CPU windows, and `wr-us-purge-effective` checks that none is left.
 
 ## Teardown: `scripts/99-teardown.sql`
 

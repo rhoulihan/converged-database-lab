@@ -46,6 +46,18 @@
 -- recursive statements are also listed from v$sql (growth over one loop, per
 -- statement: executions, rows, buffer gets and text) as METRIC and PLAN rows.
 --
+-- CPU and elapsed in microseconds per write (wr-<stmt>-us, -ela-us, and
+-- v$sql's buffer gets, -gets): the growth of v$sql over the 20 counted runs,
+-- for the write's own statements (its marker; the plain SQL inserts have two),
+-- divided by 20. The window opens after the warm-up run and closes after the
+-- last run; the COMMIT is not a statement in v$sql, so it is not in these
+-- figures, but the statement's undo and redo generation is. A duality view's
+-- or an MV log's recursive statements run inside the write and are part of
+-- its v$sql figures; the materialized view's refresh runs at COMMIT, so its
+-- statements' CPU is listed separately (wr-vs-mv-refresh-*-us-per-call) and
+-- added in wr-mv-upd-mv-total-us. Every marked cursor is purged once before
+-- the first write that uses it (tmp:wr-us-purge-left-*).
+--
 -- No ASSERT compares costs. The ASSERTs check correctness only: the same
 -- content from all four insert paths, the one-line change visible in every
 -- read, the etag check working at all (controls), the MV refreshed by FAST
@@ -83,7 +95,8 @@ create table m08d_samp (stmt varchar2(40), run number, reads number, redo number
                         cpu number, ela number);
 create table m08d_plan (stmt varchar2(40), ln number, line varchar2(400));
 create table m08d_vs (label varchar2(40), phase number, sql_id varchar2(13), child number,
-                      execs number, rws number, gets number, txt varchar2(400));
+                      execs number, rws number, gets number, txt varchar2(400),
+                      cpu number, ela number);
 
 -- ===== Parts 1 and 2: orders with lines, three projections =====
 -- The relational projection: orders and lines. Lines are keyed by lineId, a
@@ -322,6 +335,11 @@ create or replace package m08d_h as
   -- takes a snapshot before a loop; vs_done records the growth per statement
   -- class, per call, and one PLAN row per statement.
   procedure vs_snap(p_label varchar2, p_pattern varchar2);
+  -- vs_mark: a second snapshot right after the warm-up call, so CPU and
+  -- elapsed (-us-per-call, -ela-us-per-call) leave out the warm-up's parse.
+  -- They are taken over p_calls - 1 calls; executions, rows and gets keep
+  -- the whole window (p_calls calls) as before.
+  procedure vs_mark(p_label varchar2);
   procedure vs_done(p_label varchar2, p_calls number);
 end m08d_h;
 /
@@ -408,9 +426,9 @@ create or replace package body m08d_h as
 
   procedure vs_take(p_label varchar2, p_phase number) is
   begin
-    insert into m08d_vs (label, phase, sql_id, child, execs, rws, gets, txt)
+    insert into m08d_vs (label, phase, sql_id, child, execs, rws, gets, txt, cpu, ela)
       select p_label, p_phase, sql_id, child_number, executions, rows_processed, buffer_gets,
-             substr(sql_text, 1, 400)
+             substr(sql_text, 1, 400), cpu_time, elapsed_time
         from v$sql
        where regexp_like(upper(sql_text), g_pat(p_label))
          and upper(sql_text) not like '%V$SQL%';
@@ -435,11 +453,16 @@ create or replace package body m08d_h as
 
   -- Statement class: refresh-del / refresh-ins for the MV refresh, otherwise
   -- the first word and the table, e.g. insert-line, update-line, insert-mlog-cust.
+  procedure vs_mark(p_label varchar2) is
+  begin
+    vs_take(p_label, 2);
+  end;
+
   procedure vs_done(p_label varchar2, p_calls number) is
     n number := 0;
   begin
     vs_take(p_label, 1);
-    for c in (select cls, sum(de) de, sum(dr) dr, sum(dg) dg
+    for c in (select cls, sum(de) de, sum(dr) dr, sum(dg) dg, sum(dc) dc, sum(dl) dl
                 from (select case
                                when a.txt like '/* MV_REFRESH (DEL)%' then 'refresh-del'
                                when a.txt like '/* MV_REFRESH (INS)%' then 'refresh-ins'
@@ -450,11 +473,15 @@ create or replace package body m08d_h as
                                          '^mlog\$_m08d_', 'mlog-'), '^m08d_', ''), '_', '-')
                              end cls,
                              a.execs - nvl(b.execs, 0) de, a.rws - nvl(b.rws, 0) dr,
-                             a.gets - nvl(b.gets, 0) dg
+                             a.gets - nvl(b.gets, 0) dg, a.cpu - nvl(m.cpu, 0) dc,
+                             a.ela - nvl(m.ela, 0) dl
                         from m08d_vs a
                         left join m08d_vs b
                           on b.label = a.label and b.phase = 0 and b.sql_id = a.sql_id
                          and b.child = a.child
+                        left join m08d_vs m
+                          on m.label = a.label and m.phase = 2 and m.sql_id = a.sql_id
+                         and m.child = a.child
                        where a.label = p_label and a.phase = 1
                          and a.execs - nvl(b.execs, 0) > 0)
                group by cls) loop
@@ -465,6 +492,10 @@ create or replace package body m08d_h as
                        round(c.dr / p_calls, 2));
       m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-gets-per-call',
                        round(c.dg / p_calls, 2));
+      m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-us-per-call',
+                       round(c.dc / (p_calls - 1)));
+      m08_meter.record('wr-vs-' || p_label || '-' || rtrim(c.cls, '-') || '-ela-us-per-call',
+                       round(c.dl / (p_calls - 1)));
     end loop;
     -- One PLAN row per statement: growth per call and the text.
     insert into m08d_plan (stmt, ln, line)
@@ -582,6 +613,19 @@ create or replace procedure m08d_measure as
   end;
 
   -- One insert path, one k: 1 warm-up and 20 counted runs, each with its commit.
+  -- The markers of each write path's statements, for its v$sql window.
+  function mk_of(p_stmt varchar2) return varchar2 is
+  begin
+    return case p_stmt
+      when 'ins-col' then 'M08DXIC'       when 'ins-dv' then 'M08DXID'
+      when 'ins-sql' then 'M08DXIO,M08DXIL' when 'ins-sqlrow' then 'M08DXIRO,M08DXIRL'
+      when 'k3-col' then 'M08DXK3C'       when 'k3-colpos' then 'M08DXK3P'
+      when 'k3-colrep' then 'M08DXK3R'    when 'k3-dv' then 'M08DXK3V'
+      when 'k3-sql' then 'M08DXK3S'       when 'fu-col' then 'M08DXFUC'
+      when 'fu-dv' then 'M08DXFUV'
+    end;
+  end;
+
   procedure insert_path(p_path varchar2, p_k number) is
     base number := next_id;
     id   number;
@@ -619,7 +663,12 @@ create or replace procedure m08d_measure as
       end if;
       commit;
       m08d_h.sample('ins-' || p_path || '-k' || p_k, r);
+      if r = 0 then
+        m08_meter.vs_begin(mk_of('ins-' || p_path));
+        if p_path = 'dv' then m08d_h.vs_mark('ins-dv-k' || p_k); end if;
+      end if;
     end loop;
+    m08_meter.vs_end('wr-ins-' || p_path || '-k' || p_k, mk_of('ins-' || p_path), 20);
     m08d_h.summarize('ins-' || p_path || '-k' || p_k);
   end;
 
@@ -659,7 +708,12 @@ create or replace procedure m08d_measure as
       n := sql%rowcount;
       commit;
       m08d_h.sample('k3-' || p_path, r);
+      if r = 0 then
+        m08_meter.vs_begin(mk_of('k3-' || p_path));
+        if p_path = 'dv' then m08d_h.vs_mark('k3-dv'); end if;
+      end if;
     end loop;
+    m08_meter.vs_end('wr-k3-' || p_path, mk_of('k3-' || p_path), 20);
     m08_meter.record('wr-k3-' || p_path || '-rows', n);
     m08d_h.summarize('k3-' || p_path);
   end;
@@ -686,12 +740,18 @@ create or replace procedure m08d_measure as
       end;
       commit;
       m08d_h.sample('fu-' || p_what, r);
+      if r = 0 then m08_meter.vs_begin(mk_of('fu-' || p_what)); end if;
     end loop;
+    m08_meter.vs_end('wr-fu-' || p_what, mk_of('fu-' || p_what), 20);
     m08_meter.record('wr-fu-' || p_what || '-undo-records', urec);
     m08d_h.summarize('fu-' || p_what);
   end;
 
 begin
+  -- Purge every marked write cursor once, before the first write.
+  m08_meter.record('tmp:wr-us-purge-left-parts12',
+                   m08_meter.vs_purge('M08DXIC,M08DXID,M08DXIO,M08DXIL,M08DXIRO,M08DXIRL,'
+                                      || 'M08DXK3C,M08DXK3P,M08DXK3R,M08DXK3V,M08DXK3S,M08DXFUC,M08DXFUV'));
   -- ----- Part 1: inserts -----
   for k in (select 10 k from dual union all select 100 from dual) loop
     insert_path('col', k.k);
@@ -879,6 +939,10 @@ create or replace procedure m08d_measure_mv(p_phase number) as
       n := sql%rowcount;
       commit;
       m08d_h.sample(p_stmt, r);
+      if r = 0 then
+        m08_meter.vs_begin(case p_stmt when 'mv-upd-embedded' then 'M08DXMUE' else 'M08DXMU' end);
+        if p_stmt = 'mv-upd-mv' then m08d_h.vs_mark('mv-refresh'); end if;
+      end if;
       if p_stmt = 'mv-upd-mv' then
         execute immediate 'select count(*) from m08d_ord_cust_mv where cust_id = 1 and tier = :1'
           into cnt using t;
@@ -886,10 +950,12 @@ create or replace procedure m08d_measure_mv(p_phase number) as
       end if;
     end loop;
     m08_meter.record('wr-' || p_stmt || '-rows', n);
+    m08_meter.vs_end('wr-' || p_stmt, case p_stmt when 'mv-upd-embedded' then 'M08DXMUE' else 'M08DXMU' end, 20);
     m08d_h.summarize(p_stmt);
   end;
 begin
   if p_phase = 1 then
+    m08_meter.record('tmp:wr-us-purge-left-mv', m08_meter.vs_purge('M08DXMUE,M08DXMU'));
     m08_meter.measure_repeat('wr-mv-read-embedded',
       'select /*+ gather_plan_statistics M08DXMRE */ json_serialize(d.data returning blob)'
       || ' from m08d_emb d where d.data."_id" = 201', 20, p_allow_lob => true);
@@ -912,6 +978,15 @@ begin
     tier_change('mv-upd-mv', 1);
     m08d_h.vs_done('mv-refresh', 21);
     m08_meter.record('tmp:wr-mv-refreshed-runs', nref);
+    -- The tier change's CPU with its refresh: the update statement (its MV log
+    -- insert is recursive inside it) plus every statement the COMMIT runs for
+    -- the refresh (all refresh-window classes except the MV log insert).
+    select m08d_h.v('wr-mv-upd-mv-us') + nvl(sum(value), 0) into n
+      from m08_metrics
+     where name like 'wr-vs-mv-refresh-%-us-per-call'
+       and name not like '%-ela-us-per-call'
+       and name not like 'wr-vs-mv-refresh-insert-mlog%';
+    m08_meter.record('wr-mv-upd-mv-total-us', n);
     m08d_h.capture('mv-upd-mv', 'M08DXMU');
   end if;
 end;
@@ -1090,6 +1165,20 @@ select 'ASSERT:wr-plans-captured:' ||
                    where name like 'tmp:wr-%-full-scans' and value > 0) = 0
              and (select count(*) from m08_metrics
                    where name like 'tmp:wr-vs-%-classes' and value > 0) = 4
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+-- The v$sql windows: every write's marked statements ran in every counted
+-- run (at least once per call) and the purges left no marked cursor.
+select 'ASSERT:wr-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:wr-%-execs-per-call' and value >= 1) = 18
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:wr-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:wr-us-purge-left-%') = 2
+             and (select count(*) from m08_metrics where name like 'tmp:wr-us-purge-left-%' and value <> 0) = 0
             then 'PASS' else 'FAIL' end
   from dual;
 

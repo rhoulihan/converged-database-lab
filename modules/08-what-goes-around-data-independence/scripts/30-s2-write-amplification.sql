@@ -30,6 +30,12 @@
 -- Below q tier changes per 1,000 order reads, embedding does less work; above it,
 -- normalized storage does. Redo is a separate cost axis, recorded but not in the
 -- crossover; it makes the write side worse still for embedding.
+-- The same crossover is computed in CPU microseconds per statement
+-- (s2-crossover-updates-per-1000-reads-us), from m08_meter.measure_us (reads:
+-- purge, warm-up, 20 runs, v$sql growth per run) and m08_meter.measure_dml_us
+-- (updates: the same window, each run committed after the statement; the
+-- update's CPU includes its undo and redo generation). Each side's read is
+-- the cheaper of its readers in CPU.
 -- Sensitivity: the read advantage (norm_read - emb_read) is one logical read, the
 -- customer index probe the embedded read avoids. It is zero when the customer
 -- index has a single level, which is why a 50-row customer table tied. The
@@ -283,6 +289,36 @@ begin
    where c.id = c_cust;
   m08_meter.record('tmp:s2-fanout-consistent', ok);
 
+  -- CPU, elapsed and bytes (v$sql, microseconds). Reads first, then the two
+  -- updates; each update alternates SILVER and GOLD and commits after every
+  -- run, and both end on the same tier.
+  m08_meter.measure_us('s2-embedded-read',
+    'select /*+ M08SXTER */ json_serialize(d.data returning blob) from m08s2_ord_doc d'
+    || ' where d.data."_id" = 201', 'M08SXTER', null, 20, p_allow_lob => true);
+  -- Sensitivity probe: the embedded document returned as OSON (binary JSON)
+  -- instead of serialized to text.
+  m08_meter.measure_us('s2-embedded-read-oson',
+    'select /*+ M08SXTERO */ json_query(d.data, ''$'' returning blob format oson) from m08s2_ord_doc d'
+    || ' where d.data."_id" = 201', 'M08SXTERO', null, 20, p_allow_lob => true);
+  m08_meter.measure_us('s2-normalized-read-pk',
+    'select /*+ index(o m08s2_ord_pk) index(c m08s2_cust_pk) M08SXTNR */'
+    || ' o.id, o.status, o.total, c.id, c.name, c.tier'
+    || ' from m08s2_ord o join m08s2_cust c on c.id = o.cust_id where o.id = 201', 'M08SXTNR');
+  m08_meter.measure_us('s2-normalized-read-covered',
+    'select /*+ index(o m08s2_ord_cov_ix) index(c m08s2_cust_cov_ix) M08SXTNRC */'
+    || ' o.id, o.status, o.total, c.id, c.name, c.tier'
+    || ' from m08s2_ord o join m08s2_cust c on c.id = o.cust_id where o.id = 201', 'M08SXTNRC');
+  m08_meter.record('s2-normalized-read-us',
+                   least(v('s2-normalized-read-pk-us'), v('s2-normalized-read-covered-us')));
+  m08_meter.measure_dml_us('s2-embedded-update',
+    'update /*+ index(d m08s2_doc_cust_ix) M08SXTEU */ m08s2_ord_doc d'
+    || ' set d.data = json_transform(d.data, set ''$.customer.tier'' = :t)'
+    || ' where d.data.customer.custId.number() = 1', 'M08SXTEU',
+    sys.odcivarchar2list('SILVER', 'GOLD'));
+  m08_meter.measure_dml_us('s2-normalized-update',
+    'update /*+ index(c m08s2_cust_pk) M08SXTNU */ m08s2_cust c set c.tier = :t where c.id = 1',
+    'M08SXTNU', sys.odcivarchar2list('SILVER', 'GOLD'));
+
   -- Plans: every marker has a valid cursor with an INDEX step and no full table
   -- scan, and the covering reader visits no table at all.
   select case when (select count(distinct mk.marker)
@@ -338,13 +374,27 @@ begin
       m08_meter.record('s2-no-crossover', 1);
     end if;
   end;
+  -- The same crossover in CPU microseconds, rounded to two decimals. It
+  -- exists only when both the read advantage and the update penalty are
+  -- positive; otherwise s2-no-crossover-us = 1.
+  declare
+    num number := 1000 * (v('s2-normalized-read-us') - v('s2-embedded-read-us'));
+    den number := v('s2-embedded-update-us') - v('s2-normalized-update-us');
+  begin
+    if num > 0 and den > 0 then
+      m08_meter.record('s2-crossover-updates-per-1000-reads-us', round(num / den, 2));
+    else
+      m08_meter.record('s2-no-crossover-us', 1);
+    end if;
+  end;
 end;
 /
 
 -- ===== Measurements (as METRIC rows) =====
 select 'METRIC:' || name || ':' ||
        case when value = trunc(value) then to_char(value, 'FM999999990')
-            else to_char(value, 'FM999999990.0') end
+            when value = round(value, 1) then to_char(value, 'FM999999990.0')
+            else to_char(value, 'FM999999990.00') end
   from m08_metrics
  where name like 's2-%'
  order by name;
@@ -363,23 +413,38 @@ select 'ASSERT:s2-normalized-touches-1:' ||
             then 'PASS' else 'FAIL' end
   from dual;
 
--- The fan-out writes more redo than the single-row update.
-select 'ASSERT:s2-embedded-redo-gt-normalized:' ||
+-- Directions are reported as METRIC rows (1 or 0), not asserted.
+-- 1 when the fan-out writes more redo than the single-row update.
+select 'METRIC:s2-embedded-redo-gt-normalized:' ||
        case when (select value from m08_metrics where name = 's2-embedded-update-redo') >
                  (select value from m08_metrics where name = 's2-normalized-update-redo')
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from dual;
 
--- Reading an order with its customer fields is cheaper embedded than through the join.
-select 'ASSERT:s2-embedded-read-cheaper:' ||
+-- 1 when the embedded read does fewer logical reads than the join.
+select 'METRIC:s2-embedded-read-cheaper:' ||
        case when (select value from m08_metrics where name = 's2-embedded-read-reads') <
                  (select value from m08_metrics where name = 's2-normalized-read-reads')
+            then '1' else '0' end
+  from dual;
+
+-- 1 when the crossover (logical reads) is a finite number above zero.
+select 'METRIC:s2-crossover-positive:' ||
+       case when (select value from m08_metrics where name = 's2-crossover-updates-per-1000-reads') > 0
+            then '1' else '0' end
+  from dual;
+
+-- The v$sql windows: 4 reads and 2 updates, each cursor run once per call,
+-- every purge effective.
+select 'ASSERT:s2-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s2-%-execs-per-call' and value = 1) = 6
             then 'PASS' else 'FAIL' end
   from dual;
 
--- There is a finite crossover above zero.
-select 'ASSERT:s2-crossover-positive:' ||
-       case when (select value from m08_metrics where name = 's2-crossover-updates-per-1000-reads') > 0
+select 'ASSERT:s2-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s2-%-purge-left') = 6
+             and (select count(*) from m08_metrics where name like 'tmp:s2-%-purge-left' and value <> 0) = 0
             then 'PASS' else 'FAIL' end
   from dual;
 

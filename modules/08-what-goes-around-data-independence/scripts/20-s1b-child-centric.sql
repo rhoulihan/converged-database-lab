@@ -37,7 +37,15 @@
 -- above it, normalized tables do. The crossover is approximate: a one-block change
 -- in any term moves it.
 
+-- CPU, elapsed and bytes (m08b_time, after each k's reads): every reader
+-- again through m08_meter.measure_us, with its own marker (M08KIDT...): purge,
+-- warm-up, 20 runs, the growth of v$sql per run in microseconds, and the bytes
+-- one run returns. The same crossover is then computed in CPU microseconds
+-- (s1b-crossover-...-k<k>-us), each side again the cheaper of its two readers,
+-- this time in CPU.
+
 -- Clean up anything left by an earlier, interrupted run.
+drop procedure if exists m08b_time;
 drop procedure if exists m08b_load;
 drop procedure if exists m08b_measure;
 drop procedure if exists m08b_build;
@@ -327,10 +335,78 @@ begin
 end;
 /
 
+-- m08b_time(k): CPU, elapsed and bytes per reader (dynamic SQL only, so it
+-- never needs recompiling when the tables are rebuilt), then the plan facts of
+-- the timed cursors: an INDEX step each, no full table scan, and the covered
+-- child-table reader visits no table.
+create or replace procedure m08b_time(p_k number) as
+  ok number;
+  procedure t(p_rdr varchar2, p_mk varchar2, p_sql varchar2, p_lob boolean default false) is
+  begin
+    m08_meter.measure_us('s1b-' || p_rdr || '-k' || p_k, p_sql, p_mk, null, 20, p_lob);
+  end;
+  function v(p_name varchar2) return number is
+    x number;
+  begin
+    select value into x from m08_metrics where name = p_name;
+    return x;
+  end;
+begin
+  t('childtable-plain', 'M08KIDTCT',
+    'select /*+ index(l m08b_line_sku_ix) M08KIDTCT */ l.line_id, l.qty from m08b_line l where l.sku = ''X1''');
+  t('childtable-covered', 'M08KIDTCTC',
+    'select /*+ index(l m08b_line_cov_ix) M08KIDTCTC */ l.line_id, l.qty from m08b_line l where l.sku = ''X1''');
+  t('orderdocs-jsontable', 'M08KIDTOD',
+    'select /*+ M08KIDTOD */ jt.line_id, jt.qty from m08b_ord_doc d,'
+    || ' json_table(d.data, ''$.items[*]'' columns (line_id varchar2(36) path ''$.lineId'','
+    || ' sku varchar2(20) path ''$.sku'', qty number path ''$.qty'')) jt'
+    || ' where json_exists(d.data, ''$.items[*]?(@.sku == "X1")'') and jt.sku = ''X1''');
+  t('orderdocs-serialized', 'M08KIDTODS',
+    'select /*+ M08KIDTODS */ json_serialize(d.data returning blob) from m08b_ord_doc d'
+    || ' where json_exists(d.data, ''$.items[*]?(@.sku == "X1")'')', true);
+  t('itemdv', 'M08KIDTDV',
+    'select /*+ M08KIDTDV */ v.data."_id".string(), v.data.qty.number() from m08b_item_dv v'
+    || ' where v.data.sku.string() = ''X1''');
+  t('doc', 'M08KIDTDOC',
+    'select /*+ M08KIDTDOC */ json_serialize(d.data returning blob) from m08b_ord_doc d'
+    || ' where d.data."_id" = 900001', true);
+  t('join', 'M08KIDTJOIN',
+    'select /*+ M08KIDTJOIN */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
+    || ' from m08b_ord o join m08b_line l on l.order_id = o.id where o.id = 900001');
+  -- Each side's best plan in CPU: the cheaper of its two readers.
+  m08_meter.record('s1b-childtable-k' || p_k || '-us',
+                   least(v('s1b-childtable-plain-k' || p_k || '-us'), v('s1b-childtable-covered-k' || p_k || '-us')));
+  m08_meter.record('s1b-orderdocs-k' || p_k || '-us',
+                   least(v('s1b-orderdocs-jsontable-k' || p_k || '-us'), v('s1b-orderdocs-serialized-k' || p_k || '-us')));
+  select case when (select count(distinct mk.marker)
+                      from (select column_value marker from table(sys.odcivarchar2list(
+                              'M08KIDTCT', 'M08KIDTCTC', 'M08KIDTOD', 'M08KIDTODS', 'M08KIDTDV',
+                              'M08KIDTDOC', 'M08KIDTJOIN'))) mk
+                     where exists (select 1 from v$sql s join v$sql_plan p
+                                       on p.sql_id = s.sql_id and p.child_number = s.child_number
+                                    where s.sql_text like '% ' || mk.marker || ' */%'
+                                      and s.object_status = 'VALID' and s.command_type = 3
+                                      and p.operation = 'INDEX')) = 7
+               and (select count(*) from v$sql s join v$sql_plan p
+                        on p.sql_id = s.sql_id and p.child_number = s.child_number
+                     where s.sql_text like '%M08KIDT%' and s.object_status = 'VALID'
+                       and s.command_type = 3
+                       and p.operation = 'TABLE ACCESS' and p.options like '%FULL%') = 0
+               and (select count(*) from v$sql s join v$sql_plan p
+                        on p.sql_id = s.sql_id and p.child_number = s.child_number
+                     where s.sql_text like '% M08KIDTCTC */%' and s.object_status = 'VALID'
+                       and s.command_type = 3 and p.operation = 'TABLE ACCESS') = 0
+              then 1 else 0 end
+    into ok from dual;
+  m08_meter.record('tmp:s1b-us-plans-indexed-k' || p_k, ok);
+end;
+/
+
 -- k = 10 (the tables were built above)
 begin
   m08b_load(10);
   m08b_measure(10);
+  m08b_time(10);
 end;
 /
 
@@ -343,6 +419,7 @@ end;
 begin
   m08b_load(100);
   m08b_measure(100);
+  m08b_time(100);
 end;
 /
 
@@ -355,6 +432,7 @@ end;
 begin
   m08b_load(1000);
   m08b_measure(1000);
+  m08b_time(1000);
 end;
 /
 
@@ -381,63 +459,97 @@ begin
         m08_meter.record('s1b-no-crossover-k' || k.k, 1);
       end if;
     end;
+    -- The same crossover in CPU microseconds, rounded to two decimals.
+    declare
+      num number := 1000 * (v('s1b-join-k' || k.k || '-us') - v('s1b-doc-k' || k.k || '-us'));
+      den number := v('s1b-orderdocs-k' || k.k || '-us') - v('s1b-childtable-k' || k.k || '-us');
+    begin
+      if num > 0 and den > 0 then
+        m08_meter.record('s1b-crossover-item-queries-per-1000-order-reads-k' || k.k || '-us', round(num / den, 2));
+      else
+        m08_meter.record('s1b-no-crossover-k' || k.k || '-us', 1);
+      end if;
+    end;
   end loop;
 end;
 /
 
 -- ===== Measurements (as METRIC rows) =====
-select 'METRIC:' || name || ':' || to_char(value, 'FM999999990')
+select 'METRIC:' || name || ':' ||
+       case when value = trunc(value) then to_char(value, 'FM999999990')
+            else to_char(value, 'FM999999990.00') end
   from m08_metrics
  where name like 's1b-%'
  order by name;
 
 -- ===== Assertions (read back from m08_metrics) =====
 
--- Out-of-row documents: every match reads a whole order, more than twice the child table.
-select 'ASSERT:s1b-outofrow-penalty-k1000:' ||
+-- Directions are reported as METRIC rows (1 or 0), not asserted.
+-- Out-of-row documents: 1 when the order documents read more than twice the child table.
+select 'METRIC:s1b-outofrow-penalty-k1000:' ||
        case when (select value from m08_metrics where name = 's1b-orderdocs-k1000-reads') >
                  2 * (select value from m08_metrics where name = 's1b-childtable-k1000-reads')
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from dual;
 
--- The item-centric duality view reads the child table: it stays close to it (at most 2x).
+-- 1 when the item-centric duality view reads at most twice the child table.
 with ks as (select column_value k from table(sys.odcinumberlist(10, 100, 1000)))
-select 'ASSERT:s1b-itemdv-close-to-childtable-k' || k || ':' ||
+select 'METRIC:s1b-itemdv-close-to-childtable-k' || k || ':' ||
        case when (select value from m08_metrics where name = 's1b-itemdv-k' || k || '-reads') <=
                  2 * (select value from m08_metrics where name = 's1b-childtable-k' || k || '-reads')
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from ks
  order by k;
 
--- The bigger the order, the more the order documents overpay.
-select 'ASSERT:s1b-gap-grows-with-k:' ||
+-- 1 when the documents' read ratio over the child table is larger at k = 1000 than at k = 10.
+select 'METRIC:s1b-gap-grows-with-k:' ||
        case when (select value from m08_metrics where name = 's1b-orderdocs-k1000-reads') /
                  nullif((select value from m08_metrics where name = 's1b-childtable-k1000-reads'), 0) >
                  (select value from m08_metrics where name = 's1b-orderdocs-k10-reads') /
                  nullif((select value from m08_metrics where name = 's1b-childtable-k10-reads'), 0)
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from dual;
 
--- The penalty per item query grows once documents leave the row.
-select 'ASSERT:s1b-penalty-ratio-grows:' ||
+-- 1 when that ratio is larger at k = 1000 than at k = 100.
+select 'METRIC:s1b-penalty-ratio-grows:' ||
        case when (select value from m08_metrics where name = 's1b-orderdocs-k1000-reads') /
                  nullif((select value from m08_metrics where name = 's1b-childtable-k1000-reads'), 0) >
                  (select value from m08_metrics where name = 's1b-orderdocs-k100-reads') /
                  nullif((select value from m08_metrics where name = 's1b-childtable-k100-reads'), 0)
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from dual;
 
--- Wherever the order documents cost more per item query, there is a finite
--- crossover above zero.
+-- At each k where the order documents read more per item query: 1 when the
+-- crossover is a finite number above zero.
 with ks as (select column_value k from table(sys.odcinumberlist(10, 100, 1000)))
-select 'ASSERT:s1b-crossover-k' || k || '-positive:' ||
+select 'METRIC:s1b-crossover-k' || k || '-positive:' ||
        case when (select value from m08_metrics
                    where name = 's1b-crossover-item-queries-per-1000-order-reads-k' || k) > 0
-            then 'PASS' else 'FAIL' end
+            then '1' else '0' end
   from ks
  where (select value from m08_metrics where name = 's1b-orderdocs-k' || k || '-reads') >
        (select value from m08_metrics where name = 's1b-childtable-k' || k || '-reads')
  order by k;
+
+-- The v$sql windows: 7 readers at 3 k, each cursor run once per call, every
+-- purge effective, and the timed cursors' plans indexed with no full scan.
+select 'ASSERT:s1b-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s1b-%-execs-per-call' and value = 1) = 21
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1b-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s1b-%-purge-left') = 21
+             and (select count(*) from m08_metrics where name like 'tmp:s1b-%-purge-left' and value <> 0) = 0
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1b-us-plans-indexed:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s1b-us-plans-indexed-k%' and value = 1) = 3
+            then 'PASS' else 'FAIL' end
+  from dual;
 
 -- Every item reader returned the same 20 (line_id, qty) pairs at every k.
 select 'ASSERT:s1b-same-content:' ||
@@ -458,6 +570,7 @@ select 'ASSERT:s1b-plans-indexed:' ||
 -- rollback would not remove them. The meter package and m08_metrics stay.
 delete from m08_metrics where name like 's1b-%' or name like 'tmp:s1b-%';
 
+drop procedure if exists m08b_time;
 drop procedure if exists m08b_load;
 drop procedure if exists m08b_measure;
 drop procedure if exists m08b_build;

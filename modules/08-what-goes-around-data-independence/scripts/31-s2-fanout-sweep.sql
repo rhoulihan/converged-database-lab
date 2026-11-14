@@ -30,6 +30,11 @@
 -- 'ALLSTATS LAST') and printed as PLAN rows.
 -- CPU and elapsed medians (20 timed runs, 1 cs resolution, each run committed
 -- after its measurement) are recorded for the embedded update at N = 100 and 1000.
+-- CPU, elapsed and bytes in microseconds at every N, for all five statements
+-- (m08_meter.measure_us for the reads, measure_dml_us for the updates: purge,
+-- warm-up, 20 runs, v$sql growth per run; each update run committed after the
+-- statement). Each timed cursor must run the counted cursor's plan
+-- (s2c-us-same-plan). The crossover is also computed in CPU microseconds.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08c2_measure;
@@ -359,6 +364,28 @@ begin
   if p_n in (100, 1000) then
     time_update;
   end if;
+
+  -- CPU microseconds, elapsed and bytes (v$sql, 20 runs). The reads keep the
+  -- counted text without gather_plan_statistics; each update alternates
+  -- SILVER and GOLD from SILVER, so both models end on the same tier.
+  for st in (select column_value stmt from table(sys.odcivarchar2list(
+               'embedded-read', 'normalized-read-pk', 'normalized-read-covered'))) loop
+    declare
+      mk varchar2(30) := 'M08C2U' || case st.stmt when 'embedded-read' then 'ER'
+                                                  when 'normalized-read-pk' then 'NR'
+                                                  else 'NRC' end || sfx;
+    begin
+      m08_meter.measure_us(pfx || '-' || st.stmt,
+                           replace(read_sql(st.stmt, mk), 'gather_plan_statistics ', ''), mk,
+                           null, 20, p_allow_lob => st.stmt = 'embedded-read');
+    end;
+  end loop;
+  m08_meter.record(pfx || '-normalized-read-us',
+                   least(v(pfx || '-normalized-read-pk-us'), v(pfx || '-normalized-read-covered-us')));
+  m08_meter.measure_dml_us(pfx || '-embedded-update', upd_sql('embedded-update', 'M08C2UEU' || sfx, false),
+                           'M08C2UEU' || sfx, sys.odcivarchar2list('SILVER', 'GOLD'));
+  m08_meter.measure_dml_us(pfx || '-normalized-update', upd_sql('normalized-update', 'M08C2UNU' || sfx, false),
+                           'M08C2UNU' || sfx, sys.odcivarchar2list('SILVER', 'GOLD'));
 end;
 /
 
@@ -390,6 +417,18 @@ begin
         m08_meter.record(p || '-crossover-updates-per-1000-reads', round(num / den, 2));
       else
         m08_meter.record(p || '-no-crossover', 1);
+      end if;
+    end;
+    -- The same crossover in CPU microseconds.
+    declare
+      p   varchar2(30) := 's2c-n' || n.n;
+      num number := 1000 * (v(p || '-normalized-read-us') - v(p || '-embedded-read-us'));
+      den number := v(p || '-embedded-update-us') - v(p || '-normalized-update-us');
+    begin
+      if num > 0 and den > 0 then
+        m08_meter.record(p || '-crossover-updates-per-1000-reads-us', round(num / den, 2));
+      else
+        m08_meter.record(p || '-no-crossover-us', 1);
       end if;
     end;
   end loop;
@@ -467,6 +506,27 @@ select 'ASSERT:s2c-crossover-recorded:' ||
                            where name = 's2c-n' || n || '-crossover-updates-per-1000-reads' and value > 0)
                        + (select count(*) from m08_metrics
                            where name = 's2c-n' || n || '-no-crossover' and value = 1) = 1) = 3
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+-- The v$sql windows: every timed cursor ran once per call, every purge was
+-- effective, and each ran the counted cursor's plan (5 statements at 3 N).
+select 'ASSERT:s2c-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s2c-n%-execs-per-call' and value = 1) = 15
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s2c-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s2c-n%-purge-left') = 15
+             and (select count(*) from m08_metrics where name like 'tmp:s2c-n%-purge-left' and value <> 0) = 0
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s2c-us-same-plan:' ||
+       case when (select count(*) from m08_metrics u join m08_metrics c
+                     on c.name = replace(u.name, '-us-phv', '-phv')
+                   where u.name like 'tmp:s2c-n%-us-phv' and u.value = c.value) = 15
             then 'PASS' else 'FAIL' end
   from dual;
 

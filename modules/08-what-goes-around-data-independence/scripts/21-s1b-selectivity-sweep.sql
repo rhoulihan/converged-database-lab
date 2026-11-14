@@ -31,6 +31,12 @@
 -- decimals, so a small value is not shown as a whole number or as 0. CPU and elapsed medians
 -- (m08_meter.measure_repeat, 20 runs, 1 cs resolution) are recorded for the
 -- item readers at M = 100 and 500.
+-- CPU, elapsed and bytes at every point (m08_meter.measure_us: purge, warm-up,
+-- 20 runs, v$sql growth per run in microseconds): every item reader at every M
+-- and the doc and join reads, each with its own marker (M08C1U...). Its plan
+-- hash must equal the counted cursor's (s1c-us-same-plan). The crossover is
+-- also computed in CPU microseconds (...-crossover-...-us), each side the
+-- cheaper of its readers in CPU.
 
 -- Clean up anything left by an earlier, interrupted run.
 drop procedure if exists m08c1_build;
@@ -324,6 +330,33 @@ begin
     m08_meter.record('tmp:' || pfx || '-m' || ms(i) || '-same-content', same_content(ms(i)));
   end loop;
 
+  -- CPU microseconds, elapsed and bytes at every point (v$sql, 20 runs).
+  -- The doc's bytes are already recorded above (-doc-bytes), so not again.
+  m08_meter.measure_us(pfx || '-doc',
+    'select /*+ M08C1UDOCK' || p_k || ' */ json_serialize(d.data returning blob) from m08c1_ord_doc d'
+    || ' where d.data."_id" = 900001', 'M08C1UDOCK' || p_k, null, 20, p_allow_lob => true,
+    p_bytes => false);
+  m08_meter.measure_us(pfx || '-join',
+    'select /*+ M08C1UJOINK' || p_k || ' */ o.id, o.customer, o.status, l.line_id, l.sku, l.qty'
+    || ' from m08c1_ord o join m08c1_line l on l.order_id = o.id where o.id = 900001',
+    'M08C1UJOINK' || p_k);
+  for i in 1 .. ms.count loop
+    for rd in (select column_value rdr
+                 from table(sys.odcivarchar2list('childtable', 'orderdocs-jsontable', 'orderdocs-serialized'))) loop
+      declare
+        mk varchar2(30) := 'M08C1U' || case rd.rdr when 'childtable' then 'CT'
+                                                   when 'orderdocs-jsontable' then 'OD'
+                                                   else 'ODS' end || 'K' || p_k || 'M' || ms(i);
+      begin
+        m08_meter.measure_us(pfx || '-m' || ms(i) || '-' || rd.rdr, item_sql(rd.rdr, ms(i), mk, false),
+                             mk, null, 20, p_allow_lob => rd.rdr = 'orderdocs-serialized');
+      end;
+    end loop;
+    m08_meter.record(pfx || '-m' || ms(i) || '-orderdocs-us',
+                     least(v(pfx || '-m' || ms(i) || '-orderdocs-jsontable-us'),
+                           v(pfx || '-m' || ms(i) || '-orderdocs-serialized-us')));
+  end loop;
+
   -- CPU and elapsed medians for the item readers at M = 100 and 500 (20 runs).
   -- The timed copies have no gather_plan_statistics, so their own marker; their
   -- plan hash is recorded to check it equals the counted cursor's.
@@ -392,6 +425,19 @@ begin
                            round(num / den, 2));
         else
           m08_meter.record(p || '-m' || m.m || '-no-crossover', 1);
+        end if;
+      end;
+      -- The same crossover in CPU microseconds.
+      declare
+        p   varchar2(30) := 's1c-k' || k.k;
+        num number := 1000 * (v(p || '-join-us') - v(p || '-doc-us'));
+        den number := v(p || '-m' || m.m || '-orderdocs-us') - v(p || '-m' || m.m || '-childtable-us');
+      begin
+        if num > 0 and den > 0 then
+          m08_meter.record(p || '-m' || m.m || '-crossover-item-queries-per-1000-order-reads-us',
+                           round(num / den, 2));
+        else
+          m08_meter.record(p || '-m' || m.m || '-no-crossover-us', 1);
         end if;
       end;
     end loop;
@@ -471,6 +517,28 @@ select 'ASSERT:s1c-crossover-recorded:' ||
                              and value > 0)
                        + (select count(*) from m08_metrics
                            where name = 's1c-k' || k || '-m' || m || '-no-crossover' and value = 1) = 1) = 8
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+-- The v$sql windows: every timed cursor ran once per call, every purge was
+-- effective, and each timed cursor ran the same plan as its counted cursor
+-- (doc and join at each k, and every item reader at every point).
+select 'ASSERT:s1c-us-measured:' ||
+       case when (select count(*) from m08_metrics
+                   where name like 'tmp:s1c-k%-execs-per-call' and value = 1) = 2 * (2 + 4 * 3)
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1c-us-purge-effective:' ||
+       case when (select count(*) from m08_metrics where name like 'tmp:s1c-k%-purge-left') = 2 * (2 + 4 * 3)
+             and (select count(*) from m08_metrics where name like 'tmp:s1c-k%-purge-left' and value <> 0) = 0
+            then 'PASS' else 'FAIL' end
+  from dual;
+
+select 'ASSERT:s1c-us-same-plan:' ||
+       case when (select count(*) from m08_metrics u join m08_metrics c
+                     on c.name = replace(u.name, '-us-phv', '-phv')
+                   where u.name like 'tmp:s1c-k%-us-phv' and u.value = c.value) = 2 * (2 + 4 * 3)
             then 'PASS' else 'FAIL' end
   from dual;
 

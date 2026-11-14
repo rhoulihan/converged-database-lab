@@ -51,6 +51,56 @@ CREATE OR REPLACE PACKAGE m08_meter AS
   -- p_allow_lob is TRUE; read a stored LOB's bytes with dbms_lob instead.
   PROCEDURE measure_repeat(p_name VARCHAR2, p_sql VARCHAR2, p_runs PLS_INTEGER DEFAULT 20,
                            p_allow_lob BOOLEAN DEFAULT FALSE);
+
+  -- ===== Microsecond CPU from v$sql (the S3 (B) pattern) =====
+  -- The session statistic 'CPU used by this session' counts in centiseconds,
+  -- too coarse for one small read. v$sql keeps CPU_TIME and ELAPSED_TIME per
+  -- cursor in microseconds. These helpers take the growth of v$sql over a
+  -- window of calls, for every cursor whose text carries one of the markers in
+  -- p_markers (a comma-separated list; each marker sits last in a hint comment,
+  -- as ' <marker> */'). The figures are database-side: the statement's own
+  -- parse, execute and fetch calls, including recursive SQL it runs (a duality
+  -- view's internal statements), but not the client or the network.
+  --   vs_purge : purge those cursors, so the next call is parsed fresh, and
+  --              return how many are still in v$sql afterwards (0 when the
+  --              purge worked)
+  --   vs_begin : snapshot their totals (call it after a warm-up run)
+  --   vs_end   : record the growth per call, over p_calls calls:
+  --                <p_name>-us      CPU microseconds per call
+  --                <p_name>-ela-us  elapsed microseconds per call
+  --                <p_name>-gets    buffer gets per call (v$sql's logical reads)
+  --              and, for checks, tmp:<p_name>-execs-per-call and
+  --              tmp:<p_name>-us-phv (plan hash of the child that ran most).
+  -- A p_name starting with 'tmp:' records only tmp rows (per-target values
+  -- that a script summarizes itself).
+  FUNCTION vs_purge(p_markers VARCHAR2) RETURN NUMBER;
+  PROCEDURE vs_begin(p_markers VARCHAR2);
+  PROCEDURE vs_end(p_name VARCHAR2, p_markers VARCHAR2, p_calls PLS_INTEGER);
+  -- Bytes of one execution's result as the client receives it in text form:
+  -- for each row and column, dbms_lob.getlength of a LOB (a serialized
+  -- document) or lengthb of the value as text (numbers through to_char).
+  -- p_bind, when given, is bound to :id.
+  FUNCTION result_bytes(p_sql VARCHAR2, p_bind NUMBER DEFAULT NULL) RETURN NUMBER;
+  -- One query, the whole pattern: vs_purge (tmp:<p_name>-purge-left), parse,
+  -- one warm-up run, vs_begin, p_runs runs fetching every row (as in
+  -- measure_repeat), vs_end, then <p_name>-bytes from result_bytes. p_sql
+  -- must carry p_marker, and :id when p_bind is given. p_name at most 80 bytes.
+  -- p_bytes => FALSE skips the -bytes row (when the script records it already).
+  PROCEDURE measure_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
+                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 20,
+                       p_allow_lob BOOLEAN DEFAULT FALSE, p_bytes BOOLEAN DEFAULT TRUE);
+  -- The same window for one DML statement that binds :t: purge
+  -- (tmp:<p_name>-purge-left), one warm-up run with p_vals(1) and COMMIT,
+  -- vs_begin, then p_runs runs, run i binding p_vals(1 + mod(i, count)), each
+  -- followed by COMMIT (outside the statement, so not in its CPU), vs_end.
+  -- The statement's CPU includes its undo and redo generation.
+  PROCEDURE measure_dml_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
+                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 20);
+  -- Logical reads of one query's second execution (the first parses it), each
+  -- fetching every row, less the meter's own overhead (measured in the call):
+  -- records <p_name>-reads. Binds p_bind to :id when given.
+  PROCEDURE measure_reads(p_name VARCHAR2, p_sql VARCHAR2, p_bind NUMBER DEFAULT NULL,
+                          p_allow_lob BOOLEAN DEFAULT FALSE);
 END m08_meter;
 /
 
@@ -64,6 +114,11 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
   c_batch CONSTANT PLS_INTEGER := 1000;
 
   TYPE t_nums IS TABLE OF NUMBER;
+
+  -- v$sql windows (vs_begin / vs_end): the sql_ids found and their totals.
+  TYPE t_win IS RECORD (ids sys.odcivarchar2list, cpu NUMBER, ela NUMBER, gets NUMBER, execs NUMBER);
+  TYPE t_wins IS TABLE OF t_win INDEX BY VARCHAR2(400);
+  g_wins t_wins;
 
   FUNCTION cur(p_stat VARCHAR2) RETURN NUMBER IS
     v NUMBER;
@@ -284,6 +339,230 @@ CREATE OR REPLACE PACKAGE BODY m08_meter AS
     record(p_name || '-overhead-cpu-cs',     o_c);
     record(p_name || '-overhead-elapsed-cs', o_e);
   END measure_repeat;
+
+  -- ----- v$sql windows -----
+
+  -- ' <m1> */', ' <m2> */', ... as LIKE patterns.
+  FUNCTION pats(p_markers VARCHAR2) RETURN sys.odcivarchar2list IS
+    l sys.odcivarchar2list := sys.odcivarchar2list();
+  BEGIN
+    FOR m IN (SELECT trim(regexp_substr(p_markers, '[^,]+', 1, level)) mk FROM dual
+               CONNECT BY regexp_substr(p_markers, '[^,]+', 1, level) IS NOT NULL) LOOP
+      l.EXTEND;
+      l(l.COUNT) := '% ' || m.mk || ' */%';
+    END LOOP;
+    RETURN l;
+  END pats;
+
+  -- The sql_ids of the statements carrying the markers (never a PL/SQL block,
+  -- never a query on v$sql).
+  FUNCTION ids_of(p_markers VARCHAR2) RETURN sys.odcivarchar2list IS
+    l   sys.odcivarchar2list := pats(p_markers);
+    ids sys.odcivarchar2list;
+  BEGIN
+    SELECT DISTINCT s.sql_id BULK COLLECT INTO ids
+      FROM v$sql s
+     WHERE EXISTS (SELECT 1 FROM TABLE(l) p WHERE s.sql_text LIKE p.column_value)
+       AND s.command_type <> 47
+       AND upper(s.sql_text) NOT LIKE '%V$SQL%';
+    RETURN ids;
+  END ids_of;
+
+  -- Purge every cursor of the given sql_ids; return how many are left.
+  FUNCTION purge_ids(ids sys.odcivarchar2list) RETURN NUMBER IS
+    n_left NUMBER;
+  BEGIN
+    FOR c IN (SELECT address || ',' || hash_value n FROM v$sql
+               WHERE sql_id IN (SELECT column_value FROM TABLE(ids))) LOOP
+      BEGIN
+        sys.dbms_shared_pool.purge(c.n, 'C');
+      EXCEPTION
+        WHEN OTHERS THEN NULL;                       -- counted below as a cursor left
+      END;
+    END LOOP;
+    SELECT COUNT(*) INTO n_left FROM v$sql WHERE sql_id IN (SELECT column_value FROM TABLE(ids));
+    RETURN n_left;
+  END purge_ids;
+
+  FUNCTION vs_purge(p_markers VARCHAR2) RETURN NUMBER IS
+  BEGIN
+    RETURN purge_ids(ids_of(p_markers));
+  END vs_purge;
+
+  -- Snapshot the totals of the given sql_ids under the window key p_key.
+  PROCEDURE begin_ids(p_key VARCHAR2, ids sys.odcivarchar2list) IS
+    w t_win;
+  BEGIN
+    w.ids := ids;
+    SELECT nvl(SUM(cpu_time), 0), nvl(SUM(elapsed_time), 0), nvl(SUM(buffer_gets), 0),
+           nvl(SUM(executions), 0)
+      INTO w.cpu, w.ela, w.gets, w.execs
+      FROM v$sql WHERE sql_id IN (SELECT column_value FROM TABLE(w.ids));
+    g_wins(p_key) := w;
+  END begin_ids;
+
+  PROCEDURE vs_begin(p_markers VARCHAR2) IS
+  BEGIN
+    begin_ids(p_markers, ids_of(p_markers));
+  END vs_begin;
+
+  PROCEDURE vs_end(p_name VARCHAR2, p_markers VARCHAR2, p_calls PLS_INTEGER) IS
+    w   t_win := g_wins(p_markers);
+    c   NUMBER;
+    e   NUMBER;
+    g   NUMBER;
+    x   NUMBER;
+    phv NUMBER;
+    tn  VARCHAR2(100) := CASE WHEN p_name LIKE 'tmp:%' THEN p_name ELSE 'tmp:' || p_name END;
+  BEGIN
+    SELECT nvl(SUM(cpu_time), 0), nvl(SUM(elapsed_time), 0), nvl(SUM(buffer_gets), 0),
+           nvl(SUM(executions), 0),
+           MAX(plan_hash_value) KEEP (DENSE_RANK LAST ORDER BY executions)
+      INTO c, e, g, x, phv
+      FROM v$sql WHERE sql_id IN (SELECT column_value FROM TABLE(w.ids));
+    record(p_name || '-us',     round((c - w.cpu) / p_calls));
+    record(p_name || '-ela-us', round((e - w.ela) / p_calls));
+    record(p_name || '-gets',   round((g - w.gets) / p_calls, 1));
+    record(tn || '-execs-per-call', round((x - w.execs) / p_calls, 2));
+    record(tn || '-us-phv', phv);
+    g_wins.DELETE(p_markers);
+  END vs_end;
+
+  FUNCTION result_bytes(p_sql VARCHAR2, p_bind NUMBER DEFAULT NULL) RETURN NUMBER IS
+    c   INTEGER;
+    n   INTEGER;
+    d   dbms_sql.desc_tab2;
+    vc  VARCHAR2(32767);
+    nm  NUMBER;
+    bl  BLOB;
+    cl  CLOB;
+    tot NUMBER := 0;
+  BEGIN
+    c := dbms_sql.open_cursor;
+    BEGIN
+      dbms_sql.parse(c, p_sql, dbms_sql.native);
+      IF p_bind IS NOT NULL THEN dbms_sql.bind_variable(c, ':id', p_bind); END IF;
+      dbms_sql.describe_columns2(c, n, d);
+      FOR i IN 1 .. n LOOP
+        CASE
+          WHEN d(i).col_type IN (1, 96) THEN dbms_sql.define_column(c, i, vc, 32767);
+          WHEN d(i).col_type = 2        THEN dbms_sql.define_column(c, i, nm);
+          WHEN d(i).col_type = 113      THEN dbms_sql.define_column(c, i, bl);
+          WHEN d(i).col_type = 112      THEN dbms_sql.define_column(c, i, cl);
+          ELSE RAISE_APPLICATION_ERROR(-20806, 'm08_meter.result_bytes: column ' || i
+                                       || ' has unsupported type ' || d(i).col_type);
+        END CASE;
+      END LOOP;
+      n := dbms_sql.execute(c);
+      WHILE dbms_sql.fetch_rows(c) > 0 LOOP
+        FOR i IN 1 .. d.COUNT LOOP
+          CASE
+            WHEN d(i).col_type IN (1, 96) THEN
+              dbms_sql.column_value(c, i, vc); tot := tot + nvl(lengthb(vc), 0);
+            WHEN d(i).col_type = 2 THEN
+              dbms_sql.column_value(c, i, nm); tot := tot + nvl(lengthb(to_char(nm)), 0);
+            WHEN d(i).col_type = 113 THEN
+              dbms_sql.column_value(c, i, bl); tot := tot + nvl(dbms_lob.getlength(bl), 0);
+            ELSE
+              dbms_sql.column_value(c, i, cl); tot := tot + nvl(dbms_lob.getlength(cl), 0);
+          END CASE;
+        END LOOP;
+      END LOOP;
+      dbms_sql.close_cursor(c);
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF dbms_sql.is_open(c) THEN dbms_sql.close_cursor(c); END IF;
+        RAISE;
+    END;
+    RETURN tot;
+  END result_bytes;
+
+  PROCEDURE measure_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
+                       p_bind NUMBER DEFAULT NULL, p_runs PLS_INTEGER DEFAULT 20,
+                       p_allow_lob BOOLEAN DEFAULT FALSE, p_bytes BOOLEAN DEFAULT TRUE) IS
+    c   INTEGER;
+    ids sys.odcivarchar2list;
+    tn  VARCHAR2(100) := CASE WHEN p_name LIKE 'tmp:%' THEN p_name ELSE 'tmp:' || p_name END;
+  BEGIN
+    IF p_name IS NULL OR LENGTHB(p_name) > 80 THEN
+      RAISE_APPLICATION_ERROR(-20805, 'm08_meter.measure_us: p_name must be 1 to 80 bytes');
+    END IF;
+    IF instr(p_sql, ' ' || p_marker || ' */') = 0 THEN
+      RAISE_APPLICATION_ERROR(-20807, 'm08_meter.measure_us: p_sql does not carry ' || p_marker);
+    END IF;
+    -- The window is the statement's own sql_id, computed from its text (the
+    -- same id v$sql shows), so no scan of v$sql is needed.
+    ids := sys.odcivarchar2list(dbms_sql_translator.sql_id(p_sql));
+    record(tn || '-purge-left', purge_ids(ids));
+    c := dbms_sql.open_cursor;
+    BEGIN
+      dbms_sql.parse(c, p_sql, dbms_sql.native);
+      IF p_bind IS NOT NULL THEN dbms_sql.bind_variable(c, ':id', p_bind); END IF;
+      define_all(c, p_allow_lob);
+      run_all(c);                                   -- warm-up: parse and first run
+      begin_ids(p_marker, ids);
+      FOR i IN 1 .. p_runs LOOP
+        run_all(c);
+      END LOOP;
+      vs_end(p_name, p_marker, p_runs);
+      dbms_sql.close_cursor(c);
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF dbms_sql.is_open(c) THEN dbms_sql.close_cursor(c); END IF;
+        RAISE;
+    END;
+    IF p_bytes THEN
+      record(p_name || '-bytes', result_bytes(p_sql, p_bind));
+    END IF;
+  END measure_us;
+
+  PROCEDURE measure_dml_us(p_name VARCHAR2, p_sql VARCHAR2, p_marker VARCHAR2,
+                           p_vals sys.odcivarchar2list, p_runs PLS_INTEGER DEFAULT 20) IS
+    ids sys.odcivarchar2list;
+    tn  VARCHAR2(100) := CASE WHEN p_name LIKE 'tmp:%' THEN p_name ELSE 'tmp:' || p_name END;
+  BEGIN
+    IF instr(p_sql, ' ' || p_marker || ' */') = 0 THEN
+      RAISE_APPLICATION_ERROR(-20807, 'm08_meter.measure_dml_us: p_sql does not carry ' || p_marker);
+    END IF;
+    ids := sys.odcivarchar2list(dbms_sql_translator.sql_id(p_sql));
+    record(tn || '-purge-left', purge_ids(ids));
+    EXECUTE IMMEDIATE p_sql USING p_vals(1);        -- warm-up: parse and first run
+    COMMIT;
+    begin_ids(p_marker, ids);
+    FOR i IN 1 .. p_runs LOOP
+      EXECUTE IMMEDIATE p_sql USING p_vals(1 + MOD(i, p_vals.COUNT));
+      COMMIT;
+    END LOOP;
+    vs_end(p_name, p_marker, p_runs);
+  END measure_dml_us;
+
+  PROCEDURE measure_reads(p_name VARCHAR2, p_sql VARCHAR2, p_bind NUMBER DEFAULT NULL,
+                          p_allow_lob BOOLEAN DEFAULT FALSE) IS
+    c   INTEGER;
+    o_r NUMBER;
+    r   NUMBER;
+  BEGIN
+    FOR i IN 1 .. 2 LOOP                            -- meter overhead, warm one kept
+      snap;
+      o_r := delta('session logical reads');
+    END LOOP;
+    c := dbms_sql.open_cursor;
+    BEGIN
+      dbms_sql.parse(c, p_sql, dbms_sql.native);
+      IF p_bind IS NOT NULL THEN dbms_sql.bind_variable(c, ':id', p_bind); END IF;
+      define_all(c, p_allow_lob);
+      run_all(c);                                   -- first execution, not counted
+      snap;
+      run_all(c);
+      r := delta('session logical reads');
+      dbms_sql.close_cursor(c);
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF dbms_sql.is_open(c) THEN dbms_sql.close_cursor(c); END IF;
+        RAISE;
+    END;
+    record(p_name || '-reads', GREATEST(r - o_r, 0));
+  END measure_reads;
 END m08_meter;
 /
 
@@ -393,6 +672,26 @@ SELECT 'ASSERT:m08-meter-lob-guard-null-safe:' ||
             THEN 'PASS' ELSE 'FAIL' END
   FROM dual;
 
-DELETE FROM m08_metrics WHERE name LIKE 'm08-meter-selftest%';
+-- The v$sql helper: one marked query, 20 runs. CPU and elapsed are never
+-- negative, each run executed the query once, the purge left no cursor, and
+-- the bytes equal the result's text length computed in SQL.
+BEGIN
+  m08_meter.measure_us('m08-meter-selftest-v',
+    'select /*+ M08METERSELFTEST */ id, s from m08_meter_selftest where id <= 100',
+    'M08METERSELFTEST');
+END;
+/
+
+SELECT 'ASSERT:m08-meter-us-ready:' ||
+       CASE WHEN (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-v-us') >= 0
+             AND (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-v-ela-us') >= 0
+             AND (SELECT value FROM m08_metrics WHERE name = 'tmp:m08-meter-selftest-v-execs-per-call') = 1
+             AND (SELECT value FROM m08_metrics WHERE name = 'tmp:m08-meter-selftest-v-purge-left') = 0
+             AND (SELECT value FROM m08_metrics WHERE name = 'm08-meter-selftest-v-bytes') =
+                 (SELECT SUM(lengthb(to_char(id)) + lengthb(s)) FROM m08_meter_selftest WHERE id <= 100)
+            THEN 'PASS' ELSE 'FAIL' END
+  FROM dual;
+
+DELETE FROM m08_metrics WHERE name LIKE 'm08-meter-selftest%' OR name LIKE 'tmp:m08-meter-selftest%';
 
 drop table if exists m08_meter_selftest purge;
