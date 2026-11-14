@@ -39,7 +39,7 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | Scenario | Script(s) | Statement it tests | What it shows |
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
-| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time (microseconds from `v$sql`), the join and the serialized document are not separated at 1 and 10 lines in either layout or at 100 lines clustered (in elapsed time the join takes less at 1 and 10 lines); the document uses less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 7 to 9 microseconds at every size. The duality view is a join and costs the most CPU. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
+| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time (microseconds from `v$sql`), the join and the serialized document are not separated at 1 and 10 lines in either layout or at 100 lines clustered (in elapsed time the join takes less at 1 and 10 lines); the document uses less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 6 to 9 microseconds at every size. The duality view is a join and costs more CPU than the document and the join at every size; the record-at-a-time reader costs more than the view at 100 lines clustered and overlaps it at 1,000 lines. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
 | S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, all on the same full data, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3), and the document does the fewest reads at 1,000 lines (8). In CPU the joins are not separated from the serialized document up to 10 lines (they take less in elapsed time); the sized hash cluster uses less at 100 lines (the other co-located joins take less there only in elapsed time), and the covering index, both IOTs and the sized hash cluster at 1,000 lines.** With 20 large orders growing at once, the fixed-size clusters fall far behind in reads at 1,000 lines (64 and 118). |
 | S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 42 to 250; in CPU the order reads are not separated at 10 and 100 lines, so no crossover is stated there, and at 1,000 lines it is about 4 to 6.** |
 | S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance: **0.9 tier changes per 1,000 order reads in logical reads, and no crossover in CPU, where the join read uses less CPU than the embedded read (3 against 10 microseconds).** |
@@ -210,10 +210,12 @@ effect database-side elapsed time. Two readers are ranked in CPU only when the
 gap between their ranges is larger than one step; the ranges already hold the
 run-to-run spread. Otherwise the text says "not separated".
 
-**Which runs.** Every figure in this README is from four validator runs on
-these scripts, in November 2026: three back to back and one on a freshly built
-database. A range ("21 to 24") means the runs differed; a single figure means
-all four agreed.
+**Which runs.** Every measured figure in this README is from four validator
+runs on these scripts, in November 2026: three back to back and one on a
+freshly built database. A range ("21 to 24") means the runs differed; a single
+figure means all four agreed. The exceptions are labeled where they appear:
+the S1 (A) comparison with an earlier single-target load, and the per-step
+plan buffer counts in S3 (B), which come from one earlier plan-capture run.
 
 A note on the document readers. They serialize the document to JSON text,
 which is what a client that asks for text receives. That serialization is CPU
@@ -347,7 +349,7 @@ four runs.
   time, which has no such step, the join takes less than the document at 1
   and 10 lines in both layouts (3 to 9 against 9 to 12).
 - **Most of the document's CPU above 10 lines is making text.** Returned as
-  OSON, the same document takes 7 to 9 microseconds at every size. At 1 and
+  OSON, the same document takes 6 to 9 microseconds at every size. At 1 and
   10 lines that is not separated from the join. At 1,000 lines the document
   is stored out of the row, and the probe returns a pointer to it without
   reading the body (3 buffer gets against the serialized reader's 8), so
@@ -568,8 +570,8 @@ there).
 - **Many large orders growing at once hurt the fixed-size clusters.** With 20
   orders of 1,000 lines growing together, their overflow blocks interleave:
   the index cluster reads 64 to 65 (median) blocks and the `SIZE 512` hash
-  cluster 118, against 11 and 14 on the earlier load with one
-  large order. The plain IOT varies by target (11 to 26), and so does the
+  cluster 118, against 11 and 14 on an earlier load with one large order
+  (an earlier run, not one of the four). The plain IOT varies by target (11 to 26), and so does the
   duality view over it. The compressed IOT, moved after the load, does not.
 - **CPU (100 runs per target, about 10 microseconds of resolution).** The
   readers are told apart in CPU only where the gap is larger than that:
@@ -585,9 +587,12 @@ there).
   - at 1,000 lines the covering index, both IOTs and the sized hash cluster
     use less CPU than the document (226 to 262 against 277 to 284); the index
     cluster and the fixed hash cluster are not separated from it;
-  - the duality views use the most CPU at every size (about 2 times the
-    document at 1 line, about 8 to 9 times at 1,000 lines).
-  The document as OSON, in S1, takes 7 to 9 microseconds, so the comparison
+  - at 10 lines and above the duality views use the most CPU (about 3 times
+    the document at 10 lines, about 8 to 9 times at 1,000 lines). At 1 line
+    they are not separated from the document at this resolution (20 to 21
+    and 19 against 9 to 10); S1's 200-run figures separate them, and they take
+    more in elapsed time.
+  The document as OSON, in S1, takes 6 to 9 microseconds, so the comparison
   depends on whether the client asks for text.
 - **The document in a hash cluster** reads 1 block for most targets (up to 3)
   and uses 9 to 11 microseconds (median; 7 to 19 over the targets); it is not
@@ -1572,7 +1577,9 @@ every measured statement is printed as `PLAN` rows. Every figure is a range
 over the four runs: a range ("21 to 24") means the runs differed, a single
 figure means all four agreed. Large read counts repeat within about 2%; redo medians move by up to
 about 9% (the positional knob-3 change: 27,592 to 30,024 bytes); small read
-counts move by a few in any run.
+counts move by a few in any run. The exception is the MongoDB API row on the
+collection (table 3), whose redo moves by about 38% between runs (39,418 to
+54,339 bytes); the text under that table describes it.
 
 **The indexes are not the same on both sides.** The collection has one index,
 on `_id`. The orders and lines tables have a primary key each and an index on
