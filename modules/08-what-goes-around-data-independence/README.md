@@ -39,14 +39,14 @@ Quotes are from Stonebraker and Pavlo 2024, section 2.
 | Scenario | Script(s) | Statement it tests | What it shows |
 |---|---|---|---|
 | S3 | `01` to `08` | "there is no data independence." | The same MongoDB API code reads and writes the same results while the storage under the collection moves three times: from a collection to a table behind a duality view, then to promoted columns, then to lines in their own table. Array order after the last move is not guaranteed; see the S3 section. |
-| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In CPU time (microseconds from `v$sql`), the join and the serialized document are not separated at 1 and 10 lines in either layout or at 100 lines clustered (in elapsed time the join takes less at 1 and 10 lines); the document uses less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 6 to 9 microseconds at every size. The duality view is a join and costs more CPU than the document and the join at every size; the record-at-a-time reader costs more than the view at 100 lines clustered and overlaps it at 1,000 lines. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
-| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, all on the same full data, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3), and the document does the fewest reads at 1,000 lines (8). In CPU the joins are not separated from the serialized document up to 10 lines (they take less in elapsed time); the sized hash cluster uses less at 100 lines (the other co-located joins take less there only in elapsed time), and the covering index, both IOTs and the sized hash cluster at 1,000 lines.** With 20 large orders growing at once, the fixed-size clusters fall far behind in reads at 1,000 lines (64 and 118). |
-| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 42 to 250; in CPU the order reads are not separated at 10 and 100 lines, so no crossover is stated there, and at 1,000 lines it is about 4 to 6.** |
-| S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance: **0.9 tier changes per 1,000 order reads in logical reads, and no crossover in CPU, where the join read uses less CPU than the embedded read (3 against 10 microseconds).** |
+| S1 | `10-s1-read-by-key.sql` | "prejoins are not necessarily faster than joins", and the "lower-level, record-at-a-time interface" | For reading one order by key, the document does the fewest logical reads of the indexed designs here, in a clustered and an interleaved layout. The join's cost grows with the number of lines. **In database-side elapsed time (microseconds from `v$sql`, the unit for reads; see Resolution), the join takes less than the serialized document at 1 and 10 lines in both layouts (3 to 9 against 9 to 12); at 100 lines clustered they are not separated; the document takes less at 100 lines interleaved and at 1,000 lines.** Returned as binary JSON instead of text, the document takes 7 to 9 microseconds at every size. The duality view is a join and takes more time than the document and the join at every size; the record-at-a-time reader costs more than the view at 100 lines clustered and overlaps it at 1,000 lines. (See S1 (A): a hash cluster reads fewer blocks than the document up to 100 lines.) |
+| S1 (A) | `12-s1-physical-join.sql` | the same claim, and the objection that S1's join was a heap table no DBA would choose | Reruns S1's interleaved case on 20 target orders per size against a covering index, an index-organized table (IOT), a compressed IOT, an index cluster, a hash cluster, a duality view over the IOT, a hash cluster sized for each order size, a duality view over it, and the document in a hash cluster, all on the same full data, with no direction asserted. **Result: in logical reads the hash clusters beat the document up to 100 lines (2 reads against 3), and the document does the fewest reads at 1,000 lines (8). In elapsed time the co-located joins take less than the serialized document at 1, 10 and 100 lines (about 2 to 3 times less at 1 and 10 lines, about 1.3 to 1.5 times at 100), and the covering index, both IOTs and the sized hash cluster take less at 1,000 lines.** With 20 large orders growing at once, the fixed-size clusters fall far behind in reads at 1,000 lines (64 and 118). |
+| S1b | `20-s1b-child-centric.sql` | "prejoins are not necessarily faster than joins" (the case where it holds) | For a query on the child side ("line items with sku X"), the decomposed tables win. The script computes how many item queries per 1,000 order reads it takes before the decomposed form does less total work, in logical reads and in CPU. **In logical reads the crossover is 42 to 250. In time, at 10 lines the join reads the order in less time than the document, so the tables do less for both statements and there is no trade-off; at 100 lines the two order reads differ by one to three microseconds, so no crossover is stated; at 1,000 lines it is about 4 to 6 (computed from the CPU counter; about 5 from elapsed time).** |
+| S2 | `30-s2-write-amplification.sql` | "if the join is not one-to-many, then there will be duplicated data" | Duplication is real, and its cost depends on how often the copied field changes. A tier change rewrites every embedded copy; the embedded read skips one index probe. The script computes the update rate where the two balance: **0.9 tier changes per 1,000 order reads in logical reads, and no crossover in time, where the join read takes less than the embedded read (3 against 10 microseconds).** |
 | Sweeps (C) | `21-s1b-selectivity-sweep.sql`, `31-s2-fanout-sweep.sql` | the S1b and S2 claims, against the objection that their crossovers come from chosen parameters | S1b's crossover is swept over 5 to 500 matching orders (at 100 and 1,000 lines per order), and S2's over a fan-out of 10 to 1,000 orders per customer. **Result: in logical reads each crossover falls about in inverse proportion to its parameter, so a single crossover is one point on a curve, not a constant, and a crossover exists at every point. In CPU there is no crossover at any point of the S2 sweep; in the S1b sweep the order reads are not separated at 100 lines, and at 1,000 lines the crossover exists at every M, 6 to 16 times lower than in logical reads.** |
-| S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One canonical form (three normalized tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
+| S4 | `40-s4-two-projections.sql` | the duplicated-data claim and "there is no data independence", together | One normalized schema (three tables) projected as two different documents. The second document shape is added after the data is loaded, with one view definition and no data migration. The customer name is stored once, a change shows up in both documents at once, and only the customer-centric view may change it. |
 | S5 | `50-s5-single-collection.js` | "developers must implement joins or multi-get operations in their application" (about key-value stores) | With a partition key and a sort key, one find request returns an order header and all of its lines through an index range scan; a sort step in the database orders them. No app-side join, no multi-get. |
-| S3 at scale (B) | `60` to `69` | "there is no data independence", and the objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads and CPU per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3 compared with stage 2). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
+| S3 at scale (B) | `60` to `69` | "there is no data independence", and the objection that a view in front makes the unchanged app pay | The S3 stages again, on 20,000 orders, with the cost of each unchanged MongoDB API statement measured at each stage (logical reads, CPU and elapsed time per call, from `v$sql`) and its executed plan captured, with no direction asserted. Results are the same at every stage. **Result: the unchanged app never got cheaper than on the plain collection** (four of six statements got slower at stage 3 compared with stage 2). On this build, fields kept in the flex column lose their JSON-path indexes through the view (the rare-sku find: 6 reads on the collection, about 1,500 through the view); promoting a field to a real column wins back part of the cost. |
 | Writes (D) | `70-writes.sql`, `71-writes-api.js` | the objection that S2 measured only one kind of write | Inserts and a one-line change (knob 3) through a collection, a duality view and plain SQL, in SQL and through the MongoDB API; etags after a customer rename; and a materialized view as a third way to keep a copy in sync. No direction asserted. **Result: a duality view insert costs about what row-by-row SQL costs, and no less in reads (about 28% more reads at k = 100), and the MongoDB API's `$set` on a duality view locks every row of the document** (1,001 rows, the order row plus its 1,000 line rows, to change one line). The document is the cheapest insert but pays for its whole size on a one-number change; a materialized view moves the fan-out, it does not remove it. In CPU (microseconds from `v$sql`), the one-line change through the duality view costs about 160 to 310 times the row update, though it writes the same redo. |
 | teardown | `99-teardown.sql` | none | Drops the measurement harness and checks that no object from this module is left. |
 
@@ -206,9 +206,17 @@ statements per run, can be off by a few milliseconds in total (the
 record-at-a-time reader at 100 and 1,000 lines, and the one-line change
 through the duality view, which takes about 3 ms per call); none of those
 feeds a close ranking. For short statements the `-us` figure is therefore in
-effect database-side elapsed time. Two readers are ranked in CPU only when the
-gap between their ranges is larger than one step; the ranges already hold the
-run-to-run spread. Otherwise the text says "not separated".
+effect database-side elapsed time, and elapsed time (`-ela-us`) has no such
+step. So for reads this README ranks in elapsed time: two readers are ranked
+when their ranges over the four runs do not overlap (in S1 (A), when the 20
+targets agree as well); otherwise the text says "not separated". The CPU
+step still applies to CPU figures (about 5 microseconds per run at R = 200,
+10 at R = 100, 50 at R = 20), so CPU rankings of short statements need a gap
+larger than one step. Writes are ranked in CPU, because their elapsed time
+includes log and LOB waits on this shared container. In S3 at scale the
+statements run through the MongoDB API, and there elapsed time ran up to about
+twice CPU at stage 0 (the cause was not traced), so ratios against stage 0 are
+about half as large in elapsed time as in CPU; both are given.
 
 **Which runs.** Every measured figure in this README is from four validator
 runs on these scripts, in November 2026: three back to back and one on a
@@ -340,23 +348,24 @@ four runs.
 - **Logical reads: the document reads the fewest blocks.** 3 up to 100 lines
   and 8 at 1,000, against 7 to 16 for the clustered join and about one block
   per line for the interleaved join.
-- **CPU (200 runs, about 5 microseconds of resolution).** At 1 and 10 lines,
-  in both layouts, the join and the serialized document are not separated (3
-  to 9 against 9 to 16 microseconds; the gaps are at most one step). At 100
-  lines clustered they are not separated either (33 to 36 against 35 to 40).
-  At 100 lines interleaved and at 1,000 lines the document uses less (35 to 40
-  against 56 to 62; 274 to 285 against 312 to 635). In database-side elapsed
-  time, which has no such step, the join takes less than the document at 1
-  and 10 lines in both layouts (3 to 9 against 9 to 12).
-- **Most of the document's CPU above 10 lines is making text.** Returned as
-  OSON, the same document takes 6 to 9 microseconds at every size. At 1 and
-  10 lines that is not separated from the join. At 1,000 lines the document
-  is stored out of the row, and the probe returns a pointer to it without
-  reading the body (3 buffer gets against the serialized reader's 8), so
-  there its figure leaves out the body read and is only a lower bound.
+- **Time (elapsed, 200 runs).** At 1 and 10 lines, in both layouts, the
+  join takes less than the serialized document (3 to 9 against 9 to 12
+  microseconds). At 100 lines clustered they are not separated (33 to 37
+  against 35 to 36). At 100 lines interleaved and at 1,000 lines the document
+  takes less (35 to 39 against 57 to 63; 276 to 285 against 314 to 635). The
+  CPU column reads the same way, but at 1 and 10 lines its gaps are at most
+  one CPU step, which is why an earlier reading called them not separated.
+- **Most of the document's time above 10 lines is making text.** Returned as
+  OSON, the same document takes 7 to 9 microseconds at every size. At 1 line
+  the join still takes less (3 to 4 against 7 to 8); at 10 lines they are not
+  separated. At 1,000 lines the document is stored out of the row, and the
+  probe returns a pointer to it without reading the body (3 buffer gets
+  against the serialized reader's 8), so there its figure leaves out the body
+  read and is only a lower bound.
 - **The duality view is a join that also builds the document on every
-  read.** It uses about 2 to 3 times the document's CPU at 1 line (19 to 24)
-  and about 8 to 10 times at 1,000 lines (2,339 to 2,858 microseconds).
+  read.** It takes about 2 times the document's time at 1 line (19 to 20
+  microseconds elapsed) and about 8 to 10 times at 1,000 lines (2,342 to
+  2,861).
 - **Bytes.** As text, the document is larger than the row set: it carries
   every field name, while the row set repeats the order fields on every line.
   112 against 38 bytes at one line, about 25% more at 100 and 1,000 lines.
@@ -573,26 +582,25 @@ there).
   cluster 118, against 11 and 14 on an earlier load with one large order
   (an earlier run, not one of the four). The plain IOT varies by target (11 to 26), and so does the
   duality view over it. The compressed IOT, moved after the load, does not.
-- **CPU (100 runs per target, about 10 microseconds of resolution).** The
-  readers are told apart in CPU only where the gap is larger than that:
-  - at 1 and 10 lines no join is separated from the document in CPU (3 to 10
-    microseconds against 9 to 12). In database-side elapsed time, which has
-    no such step, every co-located join and the heap join take less than the
-    document (3 to 10 against 9 to 12), and the document in a hash cluster is
-    not separated from it;
-  - at 100 lines the sized hash cluster uses less CPU than the document (24
-    against 35 to 36); the fixed hash cluster (24 to 25), the covering index,
-    the IOTs and the index cluster (26 to 28) are not separated in CPU, and
-    all of them take less in elapsed time;
-  - at 1,000 lines the covering index, both IOTs and the sized hash cluster
-    use less CPU than the document (226 to 262 against 277 to 284); the index
-    cluster and the fixed hash cluster are not separated from it;
-  - at 10 lines and above the duality views use the most CPU (about 3 times
-    the document at 10 lines, about 8 to 9 times at 1,000 lines). At 1 line
-    they are not separated from the document at this resolution (20 to 21
-    and 19 against 9 to 10); S1's 200-run figures separate them, and they take
-    more in elapsed time.
-  The document as OSON, in S1, takes 6 to 9 microseconds, so the comparison
+- **Time (elapsed, median over the 20 targets).** The tables above give CPU;
+  the elapsed medians (`s1a-<reader>-k<k>-t20-ela-us-median`) agree with them
+  within a few microseconds, and reads are ranked in elapsed time (see
+  Resolution):
+  - at 1 and 10 lines every co-located join and the heap join take less than
+    the document (3 to 10 against 9 to 12 microseconds, about 2 to 3 times
+    less), on every target; the document in a hash cluster (9 and 11) is not
+    separated from the document;
+  - at 100 lines the hash clusters (24 to 25), the covering index (26 to 27),
+    the IOTs (27 to 29) and the index cluster (27) take less than the document
+    (36), about 1.3 to 1.5 times less in the medians; a few targets of several
+    designs reach the document's range;
+  - at 1,000 lines the sized hash cluster (223 to 227), the covering index
+    (240 to 249) and both IOTs (250 to 258) take less than the document (277
+    to 282); the index cluster (279 to 291) and the fixed hash cluster (272 to
+    277) are not separated from it;
+  - the duality views take the most time at every size: 19 to 21 at 1 line,
+    about 3 times the document at 10 lines, about 8 to 9 times at 1,000 lines.
+  The document as OSON, in S1, takes 7 to 9 microseconds, so the comparison
   depends on whether the client asks for text.
 - **The document in a hash cluster** reads 1 block for most targets (up to 3)
   and uses 9 to 11 microseconds (median; 7 to 19 over the targets); it is not
@@ -739,16 +747,18 @@ every cell is a range over the four runs.
   serialized (or scanned by `JSON_TABLE`) whole, and the serialized reader
   returns 10,771 to 998,971 bytes to deliver 20 pairs (200 to 240 bytes from
   the child table).
-- **The order read by key, in CPU (200 runs, about 5 microseconds of
-  resolution).** At 10 lines they are not separated in CPU (6 against 11 to
-  12, a gap of one step); in elapsed time the join takes less. At 100 lines
-  they are not separated (33 to 37 against 34 to 35). At 1,000 lines the
-  document uses less (276 to 285 against 305 to 310).
-- **So the crossover in CPU:** at 10 and 100 lines the order reads are not
-  separated, so no crossover is stated (at 10 lines no run computed one; at
-  100 lines two runs computed 1.76 and 3.55, and two none). At 1,000 lines it
-  is 3.56 to 6.32 item queries per 1,000 order reads in all four runs,
-  against 42 to 50 in logical reads.
+- **The order read by key, in elapsed time (200 runs).** At 10 lines the
+  join takes less (6 against 11 to 12 microseconds), so the tables take less
+  for both statements and there is no trade-off to compute. At 100 lines the
+  join takes 33 to 34 against the document's 35 to 36, a gap of one to three
+  microseconds, too small to state a crossover on. At 1,000 lines the document
+  takes less (275 to 284 against 303 to 307). In CPU the 10-line gap is one
+  CPU step, which is why the CPU computation found no crossover there.
+- **So the crossover in time:** none is stated at 10 and 100 lines (in CPU, at
+  10 lines no run computed one; at 100 lines two runs computed 1.76 and 3.55,
+  and two none). At 1,000 lines the CPU-counter computation gives 3.56 to 6.32
+  item queries per 1,000 order reads in all four runs, and the elapsed figures
+  give about 5, against 42 to 50 in logical reads.
 
 Expected assertions:
 
@@ -880,12 +890,12 @@ runs.
 | normalized-update | 7 | 9 to 12 | - |
 | crossover (tier changes per 1,000 order reads) | 0.90 | none | |
 
-- **In CPU the embedded read costs more than the join.** The embedded order
+- **In time the embedded read costs more than the join.** The embedded order
   takes 10 microseconds and the normalized join 3. The embedded read saves an
   index probe in logical reads, but returning a document costs more CPU than
   returning a row. Returned as OSON instead of text
-  (`s2-embedded-read-oson`), it takes 8, which is not separated from the
-  join's 3 at this resolution.
+  (`s2-embedded-read-oson`), it takes 8, still more than the join's 3 in
+  elapsed time (the CPU gap is one step).
 - **So in CPU there is no crossover** (`s2-no-crossover-us` = 1 in all four
   runs): the normalized form uses less CPU for the read and for the tier
   change (9 to 12 microseconds against about 2,800 to 2,900 for 100
@@ -1155,16 +1165,16 @@ Metrics:
 - from `measure_us` / `measure_dml_us`: `s1c-k{k}-m{M}-{reader}-{us|ela-us|gets|bytes}`, `s1c-k{k}-{doc|join}-{us|ela-us|gets}` (and `s1c-k{k}-join-bytes`), `s1c-k{k}-m{M}-orderdocs-us`; `s2c-n{N}-{statement}-{us|ela-us|gets}`, `-bytes` for the reads, `s2c-n{N}-normalized-read-us`;
 - the CPU crossovers `s1c-k{k}-m{M}-crossover-item-queries-per-1000-order-reads-us` (or `s1c-k{k}-m{M}-no-crossover-us`) and `s2c-n{N}-crossover-updates-per-1000-reads-us` (or `s2c-n{N}-no-crossover-us`).
 
-### S4: one canonical form, two documents (`scripts/40-s4-two-projections.sql`)
+### S4: one normalized schema, two documents (`scripts/40-s4-two-projections.sql`)
 
 Stonebraker and Pavlo make two claims about document databases (section 2.3,
 p.23): "if the join is not one-to-many, then there will be duplicated data", and
 "there is no data independence". S4 tests both with one setup. It is a
 correctness check, not a measurement.
 
-The canonical form is three normalized tables: customers, orders, and order
+The schema is three normalized tables: customers, orders, and order
 lines. Each customer's name is stored once, in the customer row. Two duality
-views project that one canonical form as two different documents. The
+views project those tables as two different documents. The
 customer-centric view is created before the data is loaded; the order-centric
 view is created after the data is loaded and committed, the way a second
 application would arrive later:
@@ -1192,7 +1202,7 @@ of the name to change.
   but the name is not copied into any order. A scan of every text and JSON
   column in the S4 tables finds the new name exactly once (`s4-name-copies`),
   and the order and line tables have no name column at all.
-- **Data independence.** One canonical form serves two document shapes. Neither
+- **Data independence.** One normalized schema serves two document shapes. Neither
   application has to know how the data is stored, and neither shape forces a
   storage layout on the other. Adding the second shape over data that was
   already stored took one view definition, not a data migration
@@ -1391,9 +1401,11 @@ match the measured cursor's. The API sends the same SQL text at every stage
 (the `sql_id` does not change), because it queries the name `m08b3_orders`,
 whatever is behind it.
 
-**Cheaper, the same, or slower.** Both logical reads and CPU per call count,
-each compared with the stage named. Reads within about 1%, and CPU within
-about 10% or under 0.1 ms per call, count as unchanged. A statement is
+**Cheaper, the same, or slower.** Both logical reads and time per call count,
+each compared with the stage named. Reads within about 1%, and time within
+about 10%, count as unchanged. For calls under about 1 ms, where a CPU change
+can be smaller than one 50-microsecond step at R = 20, time is read in
+elapsed time, whose four-run ranges must not overlap. A statement is
 *cheaper* when one of the two goes down and the other does not go up, *slower*
 when one goes up and the other does not go down, and *the same* when neither
 changes. When one goes down and the other up, the text names both.
@@ -1411,6 +1423,20 @@ milliseconds in brackets:
 | `agg-status` | 1,173 to 1,174 (11.6 to 12.1) | 1,508 (463 to 468) | 1,508 (57 to 58) | 20,137 to 20,324 (1,115 to 1,128) |
 | `agg-unwind` | 1,577 to 1,634 (1,462 to 1,476) | 1,508 (2,354 to 2,404) | 1,508 (2,341 to 2,387) | 17,224 to 17,420 (3,384 to 3,460) |
 
+Elapsed time per call in milliseconds, same four runs (`s3b-<statement>-stage<N>-ela-us`).
+Through the MongoDB API, elapsed time ran up to about twice CPU at stage 0
+(the cause was not traced), so ratios against stage 0 are about half as large
+in elapsed time as in CPU; the direction of every change is the same in both:
+
+| Statement | Stage 0 | Stage 1 | Stage 2 | Stage 3 |
+|---|---|---|---|---|
+| `byid` | 0.04 to 0.08 | 0.17 to 0.24 | 0.14 to 0.18 | 0.17 to 0.23 |
+| `status` | 5.0 to 5.6 | 474 to 478 | 60 to 68 | 86 to 88 |
+| `sku-hot` | 6.1 to 6.9 | 507 to 510 | 505 to 515 | 121 to 127 |
+| `sku-rare` | 0.05 to 0.06 | 428 to 434 | 424 to 429 | 0.24 to 0.31 |
+| `agg-status` | 13.6 to 14.9 | 465 to 470 | 58.9 to 59.7 | 1,117 to 1,131 |
+| `agg-unwind` | 1,464 to 1,478 | 2,356 to 2,405 | 2,343 to 2,389 | 3,386 to 3,461 |
+
 **Direct-SQL controls** (same four runs; SQL sent straight to the tables, not
 app statements):
 
@@ -1426,14 +1452,17 @@ app statements):
 **Plain reading.**
 
 - **No statement is cheaper at any later stage than on the plain collection.**
-  The best any of them does is tie (`byid` at stages 1 and 2: the same 3
-  reads, CPU under 0.1 ms per call). `agg-unwind` at stages 1 and 2 is mixed:
+  None ties. `byid` at stages 1 and 2 reads the same 3 blocks but takes about
+  2 to 5 times as long in elapsed time (0.04 to 0.08 ms on the collection,
+  0.14 to 0.24 through the view); its CPU change is under one 50-microsecond
+  step at R = 20, so CPU alone cannot rank it. `agg-unwind` at stages 1 and 2 is mixed:
   about 4 to 8% fewer reads (1,508 against 1,577 to 1,634), but about 60% more
   CPU.
 - **Stage 0 to 1, the day-one cost of putting a view in front: four of six
   statements got slower on both reads and CPU; `agg-unwind` is mixed (about 4 to 8%
   fewer reads, 1,577 to 1,634 down to 1,508, but about 60% more CPU, about 1.5
-  to about 2.4 seconds); `byid` stayed the same.** On this build, MongoDB API
+  to about 2.4 seconds); `byid` reads the same 3 blocks but got slower in
+  elapsed time (about 2 to 5 times).** On this build, MongoDB API
   filters on fields stored in the flex column are applied to the constructed
   document and cannot use indexes on the underlying column; fields mapped to
   real columns (here only `_id`) are pushed down. The executed plan is a full
